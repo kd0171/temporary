@@ -1,1681 +1,219 @@
-コンテンツへとスキップする
-あなた:
-📌 目的
-
-Pandas DataFrame にある removal_reason 列から「表現揺れを正規化したキー列」と
-「クラスタリングに基づくカテゴリー列」を作成したい。
-
-最終的には Dash のフィルターに使えるカテゴリー列を作りたい。
-
-📌 やりたい処理の全体像
-① 前処理
-
-小文字化
-
-記号除去
-
-s が付く / 付かない（blade / blades / cracks）問題の吸収
-
-トークン正規化（簡易レマタイザで OK）
-
-略語辞書（CSV）を読み込んでパターン置換
-
-全フル表現も同じキーにマップする
-
-最終的には "high_pressure_turbine_blade_crack" のように
-スペース → アンダーバー で 1 トークン化する
-
-出力：reason_key 列
-
-② 特徴量化（Transformer）
-
-SentenceTransformer（例：all-MiniLM-L6-v2）で埋め込み生成
-
-ただし Transformer は毎回 Dash 起動時に動かさない
-→ 埋め込みは別スクリプトで一度だけ作る
-
-結果を .npy または DataFrame の列に保存する
-
-出力：embeddings.npy または DataFrame["embedding"]
-
-③ クラスタリング（K-means）
-
-埋め込みを K-means に投入
-
-学習は 1 回だけ
-
-クラスタ中心（centroids）を保存する
-
-必要であればクラスタごとに「意味的な名前」をつける
-例： {0: "blade_damage", 1: "oil_system", ...}
-
-出力： cluster_id 列、cluster_name 列、center.npy
-
-④ 推論（新規データ）
-
-normalize → pattern replace → to_key
-
-Transformer でベクトル化 → 最も近いクラスタを割り当てる
-
-対応する cluster_name を返す
-
-既存の辞書にあれば辞書優先で上書きする
-
-出力：新規データにも cluster_id と cluster_name を追加
-
-⑤ Dash 適用
-
-cluster_name をフィルター項目として使用
-
-チェックリストは他のフィルターと同じ形式
-
-apply_all_filters() に
-"reason_category": "cluster_name" を追加すれば反映される
-
-プロンプト中で生成してほしい成果物
-🔹1. 正規化関数
-
-normalize_text_basic()
-s 問題の処理
-略語 CSV の適用関数（load_abbrev_patterns, apply_abbrev_to_text）
-
-🔹2. add_reason_key(df)
-
-DataFrame に reason_key を作成する関数。
-
-🔹3. 埋め込み生成スクリプト
-
-create_embeddings.py
-
-🔹4. クラスタリングと可視化（任意）
-
-cluster_reviews.py
-
-🔹5. 推論スクリプト
-
-predict_reason_category(text) で返る。
-
-6. Dash 用の加工
-
-reason_category 列を作って CSV として保存しておく処理。
-
-🔹7. すべてのコードが再現可能なように
-
-必要なフォルダ構成例も作る。
-
-📌 追加条件
-
-Pandas + scikit-learn + sentence-transformers を使う
-
-Python3.10 以上
-
-再現性確保
-
-コメント多め
-
-実務で使える堅牢な構成
-
-パフォーマンスも考慮
-
-辞書がヒットしない場合は Transformer 推論に fallback
-
-すべてのコードは独立して動くように記述
-
-出力形式の希望
-
-処理の概要説明
-
-推奨フォルダ構造
-
-スクリプトごとのコード（--- code --- で区切る）
-
-Dash へ統合するためのアドバイス
-
-新規データが来る場合の運用フロー
-
-今後改善するべきポイント
-
-データを取得するコンポーネントでtest_dfとしてデータを取得しており、その中の文字列を含む列にカテゴリー列を上記の前処理、カテゴリー化をした上で追加するような関数を別ファイルに書いてほしい
-ChatGPT:
-
-思考時間: 1m 13s
-まずは全体像からコードまで一気に出します。そのあと Dash への統合や運用フローもまとめます。
-
-1. 処理の概要
-やりたいことを最低限のパイプラインに整理すると：
-
-正規化
-
-小文字化・記号除去・簡易レマタイズ（s 問題）・略語展開
-
-結果を "high_pressure_turbine_blade_crack" のような reason_key にする
-
-埋め込み生成（別スクリプト）
-
-reason_key のユニーク値だけを SentenceTransformer でベクトル化
-
-embeddings.npy と reason_keys.npy を保存
-
-クラスタリング（別スクリプト）
-
-K-means でクラスタリング
-
-KMeans モデルとメタ情報（cluster_name 辞書・reason_key→cluster_id 辞書）を保存
-
-推論
-
-新規テキストを正規化 → reason_key を生成
-
-既知の reason_key なら辞書からクラスタを取得
-
-未知なら埋め込み＋KMeans で最近傍クラスタを割り当て
-
-cluster_id / cluster_name / reason_category を返す
-
-Dash
-
-事前に CSV に reason_category を付与しておき、チェックリストフィルタに利用
-
-Dash 内で動的に付与したい場合のために test_df に列を追加する関数も別ファイルで用意
-
-2. 推奨フォルダ構造（シンプル版）
-project_root/
-├─ data/
-│   ├─ removal_reasons.csv        # 元データ（任意）
-│   └─ abbrev_patterns.csv        # 略語辞書
-├─ models/
-│   ├─ embeddings.npy             # 埋め込み
-│   ├─ reason_keys.npy            # 埋め込み順の reason_key
-│   ├─ kmeans.joblib              # 学習済み KMeans
-│   ├─ cluster_meta.json          # cluster_id → cluster_name
-│   └─ reason_dict.json           # reason_key → {cluster_id, cluster_name}
-├─ config.py
-├─ text_normalization.py          # 正規化・略語適用・reason_key 作成
-├─ create_embeddings.py           # 埋め込み生成スクリプト
-├─ cluster_reviews.py             # KMeans 学習 & 辞書作成スクリプト
-├─ inference.py                   # predict_reason_category など推論系
-├─ preprocess_for_dash.py         # CSV に reason_category を付与して保存
-└─ reason_category_pipeline.py    # Dash 用：test_df に列追加する関数
-3. 各ファイルのコード
-3-1. config.py
-共通のパスや列名、乱数シードをここにまとめます。
-
---- code ---
-
-# config.py
-from pathlib import Path
-
-# プロジェクトルート（このファイルのある場所）
-BASE_DIR = Path(__file__).resolve().parent
-
-# データ・モデル保存用ディレクトリ
-DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-
-# 必要なら事前に作成しておく
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-# ファイルパス
-ABBREV_CSV = DATA_DIR / "abbrev_patterns.csv"
-INPUT_CSV = DATA_DIR / "removal_reasons.csv"
-
-EMBEDDINGS_NPY = MODELS_DIR / "embeddings.npy"
-REASON_KEYS_NPY = MODELS_DIR / "reason_keys.npy"
-KMEANS_MODEL = MODELS_DIR / "kmeans.joblib"
-CLUSTER_META_JSON = MODELS_DIR / "cluster_meta.json"
-REASON_DICT_JSON = MODELS_DIR / "reason_dict.json"
-
-# SentenceTransformer モデル名
-SENTENCE_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-# 列名定義
-TEXT_COLUMN = "removal_reason"
-REASON_KEY_COLUMN = "reason_key"
-CLUSTER_ID_COLUMN = "cluster_id"
-CLUSTER_NAME_COLUMN = "cluster_name"
-REASON_CATEGORY_COLUMN = "reason_category"
-
-# 再現性用シード
-RANDOM_SEED = 42
-3-2. text_normalization.py
-ここで要求されている関数：
-
-normalize_text_basic()
-
-s 問題を処理する簡易レマタイザ
-
-load_abbrev_patterns, apply_abbrev_to_text
-
-add_reason_key(df)
-
---- code ---
-
-# text_normalization.py
-import re
-import unicodedata
-from functools import lru_cache
-from typing import List, Tuple, Optional
-
-import numpy as np
-import pandas as pd
-
-import config
-
-
-# -----------------------------
-# 略語辞書の読み込みと適用
-# -----------------------------
-
-def load_abbrev_patterns(csv_path: Optional[str] = None) -> List[Tuple[re.Pattern, str]]:
-    """
-    略語辞書 CSV を読み込み、(正規表現, 置換文字列) のリストとして返す。
-    CSV フォーマット例:
-        pattern,replacement
-        HPT,high pressure turbine
-        LPT,low pressure turbine
-    """
-    if csv_path is None:
-        csv_path = config.ABBREV_CSV
-
-    csv_path = str(csv_path)
-    df = pd.read_csv(csv_path)
-
-    if "pattern" not in df.columns or "replacement" not in df.columns:
-        raise ValueError("abbrev_patterns.csv には 'pattern', 'replacement' 列が必要です。")
-
-    patterns: List[Tuple[re.Pattern, str]] = []
-    for _, row in df.iterrows():
-        # 単語境界でマッチさせる（大文字小文字は normalize 側で吸収）
-        pat_str = r"\b" + re.escape(str(row["pattern"]).strip().lower()) + r"\b"
-        compiled = re.compile(pat_str)
-        replacement = str(row["replacement"]).strip().lower()
-        patterns.append((compiled, replacement))
-    return patterns
-
-
-@lru_cache(maxsize=1)
-def _cached_abbrev_patterns() -> List[Tuple[re.Pattern, str]]:
-    """デフォルトパスの略語辞書をキャッシュ付きで取得"""
-    try:
-        return load_abbrev_patterns()
-    except FileNotFoundError:
-        # 略語辞書が無くても動くように空リスト
-        return []
-
-
-def apply_abbrev_to_text(text: str,
-                         patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    """
-    テキストに略語辞書を適用する。
-    patterns が None の場合はデフォルトの CSV を使用。
-    """
-    if not isinstance(text, str):
-        text = "" if pd.isna(text) else str(text)
-
-    if patterns is None:
-        patterns = _cached_abbrev_patterns()
-
-    lowered = text.lower()
-    for pat, repl in patterns:
-        lowered = pat.sub(repl, lowered)
-    return lowered
-
-
-# -----------------------------
-# s 問題を含む簡易レマタイザ
-# -----------------------------
-
-def _simple_lemma(token: str) -> str:
-    """
-    非常に簡易なレマタイザ。
-    - 長さ > 3 で末尾が "ies" → "y" (e.g. "bodies" -> "body")
-    - 長さ > 3 で末尾が "es" → "e.g. "cracks" -> "crack" など
-    - 長さ > 3 で末尾が "s" → "s" を削除
-    """
-    if len(token) <= 3:
-        return token
-
-    if token.endswith("ies") and len(token) > 4:
-        # e.g. "parties" -> "party"
-        return token[:-3] + "y"
-
-    if token.endswith("es") and len(token) > 4:
-        # e.g. "cracks" ではなく "blades" 誤処理がありうるが簡易版として許容
-        return token[:-2]
-
-    if token.endswith("s"):
-        return token[:-1]
-
-    return token
-
-
-def _remove_punctuation(text: str) -> str:
-    """
-    記号を削除し、英数字・アンダーバー・スペースのみ残す。
-    """
-    # Unicode 正規化（全角 → 半角など）
-    text = unicodedata.normalize("NFKC", text)
-
-    # アルファベット/数字/スペース/アンダーバー 以外をスペースに
-    text = re.sub(r"[^\w\s]", " ", text)
-    # アンダーバーも一旦スペース扱いにする（最後に _ に再結合する）
-    text = text.replace("_", " ")
-    # 複数スペースを1つに
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def normalize_text_basic(text: str,
-                         use_abbrev: bool = True,
-                         patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    """
-    基本的な正規化:
-      - NaN/None を空文字に
-      - 小文字化
-      - 略語辞書で展開 (任意)
-      - 記号除去
-      - 簡易レマタイザ（s 問題対応）
-    """
-    if not isinstance(text, str):
-        text = "" if pd.isna(text) else str(text)
-
-    # 小文字化 + Unicode 正規化
-    text = unicodedata.normalize("NFKC", text).lower()
-
-    # 略語展開（"hpt" -> "high pressure turbine" など）
-    if use_abbrev:
-        text = apply_abbrev_to_text(text, patterns=patterns)
-
-    # 記号除去
-    text = _remove_punctuation(text)
-
-    if not text:
-        return ""
-
-    tokens = text.split()
-    lemmas = [_simple_lemma(tok) for tok in tokens]
-    return " ".join(lemmas)
-
-
-def to_reason_key(text: str,
-                  use_abbrev: bool = True,
-                  patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    """
-    normalize_text_basic() の結果をさらに
-    スペース -> アンダーバー に変換して 1 トークン化したキーを返す。
-    """
-    normalized = normalize_text_basic(text, use_abbrev=use_abbrev, patterns=patterns)
-    if not normalized:
-        return ""
-    return normalized.replace(" ", "_")
-
-
-def add_reason_key(df: pd.DataFrame,
-                   text_col: str = None,
-                   reason_key_col: str = None,
-                   abbrev_csv_path: Optional[str] = None) -> pd.DataFrame:
-    """
-    DataFrame に reason_key 列を追加する。
-    - text_col: 元のテキスト列名（例: "removal_reason"）
-    - reason_key_col: 追加する列名（例: "reason_key"）
-    """
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-    if reason_key_col is None:
-        reason_key_col = config.REASON_KEY_COLUMN
-
-    df = df.copy()
-
-    # 略語辞書パターンの指定があれば（なければデフォルトを使用）
-    patterns = None
-    if abbrev_csv_path is not None:
-        patterns = load_abbrev_patterns(abbrev_csv_path)
-
-    # ベクトル化しやすいように numpy array 経由で処理
-    texts = df[text_col].astype("object").to_numpy()
-
-    keys = [
-        to_reason_key(text, use_abbrev=True, patterns=patterns)
-        for text in texts
-    ]
-
-    df[reason_key_col] = keys
-    return df
-3-3. create_embeddings.py
-SentenceTransformer で reason_key をベクトル化して保存するスクリプト。
-
---- code ---
-
-# create_embeddings.py
-"""
-reason_key ごとの埋め込みを生成して保存するスクリプト。
-
-実行例:
-    python create_embeddings.py
-"""
-
 import json
-from typing import List
+from datetime import datetime
+from dash import Dash, html, dcc, Input, Output, State, ALL, callback, no_update
 
-import numpy as np
-import pandas as pd
-from sentence_transformers import SentenceTransformer
+app = Dash(__name__)
 
-import config
-from text_normalization import add_reason_key
+# ---------------------------
+# 1) 固定マスタ（例）
+# ---------------------------
+MASTER_ROWS = [
+    {"engine_type": "V2500", "partnumber": "72-00-00", "partname": "Engine Module"},
+    {"engine_type": "V2500", "partnumber": "72-31-00", "partname": "Fan Module"},
+    {"engine_type": "V2500", "partnumber": "72-32-00", "partname": "Intermediate Case Module"},
+]
 
+ALL_LEVELS = ["LEVEL 1", "LEVEL 2", "LEVEL 2.1", "LEVEL 2.9", "LEVEL 3"]
 
-def create_embeddings(
-    input_csv: str | None = None,
-    text_col: str | None = None,
-    reason_key_col: str | None = None,
-) -> None:
-    if input_csv is None:
-        input_csv = str(config.INPUT_CSV)
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-    if reason_key_col is None:
-        reason_key_col = config.REASON_KEY_COLUMN
+def make_row_id(r: dict) -> str:
+    return f'{r["engine_type"]}|{r["partnumber"]}'
 
-    print(f"[create_embeddings] Loading data from: {input_csv}")
-    df = pd.read_csv(input_csv)
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
-    # reason_key を付与
-    print("[create_embeddings] Adding reason_key column...")
-    df = add_reason_key(df, text_col=text_col, reason_key_col=reason_key_col)
+# ---------------------------
+# 2) html.Table を組み立て
+# ---------------------------
+def build_html_table(master_rows, preset_data_for_rows: dict):
+    """
+    preset_data_for_rows: {row_id: {"workscope_raw":[...], "selected_workscope":[...]} }
+    """
+    header = html.Thead(html.Tr([
+        html.Th("engine type"),
+        html.Th("partnumber"),
+        html.Th("partname"),
+        html.Th("workscope raw (multi)"),
+        html.Th("selected workscope (multi)"),
+    ]))
 
-    # ユニークな reason_key を抽出
-    unique_keys: List[str] = (
-        df[reason_key_col]
-        .fillna("")
-        .astype(str)
-        .replace("", np.nan)
-        .dropna()
-        .unique()
-        .tolist()
+    body_rows = []
+    for r in master_rows:
+        rid = make_row_id(r)
+        cfg = preset_data_for_rows.get(rid, {})
+        raw_val = cfg.get("workscope_raw", [])
+        sel_val = cfg.get("selected_workscope", [])
+
+        raw_dd = dcc.Dropdown(
+            options=[{"label": x, "value": x} for x in ALL_LEVELS],
+            value=raw_val,
+            multi=True,
+            placeholder="raw を選択",
+            id={"type": "raw_dd", "row_id": rid},
+        )
+
+        # selected は raw の部分集合にしたい場合、options を raw_val に寄せるのが自然。
+        # ただし raw_val が空の時に選べないので、ここでは raw_val が空なら ALL_LEVELS を出します。
+        sel_options = raw_val if raw_val else ALL_LEVELS
+        sel_dd = dcc.Dropdown(
+            options=[{"label": x, "value": x} for x in sel_options],
+            value=sel_val,
+            multi=True,
+            placeholder="selected を選択",
+            id={"type": "sel_dd", "row_id": rid},
+        )
+
+        body_rows.append(
+            html.Tr([
+                html.Td(r["engine_type"]),
+                html.Td(r["partnumber"]),
+                html.Td(r["partname"]),
+                html.Td(raw_dd),
+                html.Td(sel_dd),
+            ])
+        )
+
+    return html.Table(
+        [header, html.Tbody(body_rows)],
+        style={
+            "borderCollapse": "collapse",
+            "width": "100%",
+        }
     )
 
-    print(f"[create_embeddings] Unique reason_key count: {len(unique_keys)}")
+# ---------------------------
+# 3) レイアウト
+# ---------------------------
+app.layout = html.Div(
+    style={"maxWidth": "1200px", "margin": "0 auto", "padding": "12px"},
+    children=[
+        html.H3("Pre-Selection (html.Table版)"),
 
-    # SentenceTransformer モデルのロード
-    print(f"[create_embeddings] Loading SentenceTransformer: {config.SENTENCE_MODEL_NAME}")
-    model = SentenceTransformer(config.SENTENCE_MODEL_NAME)
+        html.Div(
+            style={"display": "flex", "gap": "8px", "alignItems": "center"},
+            children=[
+                html.Label("Preset name:"),
+                dcc.Input(id="preset_name", value="Case1", type="text", style={"width": "240px"}),
+                html.Button("保存(適用)", id="btn_save", n_clicks=0),
+                html.Button("JSONエクスポート", id="btn_export", n_clicks=0),
+                dcc.Download(id="dl_json"),
+            ],
+        ),
 
-    # 埋め込み生成
-    print("[create_embeddings] Encoding reason keys...")
-    embeddings = model.encode(
-        unique_keys,
-        batch_size=64,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,  # コサイン類似度を使う場合に便利
-    )
+        html.Hr(),
 
-    # 保存
-    print(f"[create_embeddings] Saving embeddings to {config.EMBEDDINGS_NPY}")
-    np.save(config.EMBEDDINGS_NPY, embeddings)
+        # 擬似DB（プリセットを全部持つ）
+        # 形式: {"Case1": {"row_id": {"workscope_raw":[...], "selected_workscope":[...]}, ...}, "Case2": {...}}
+        dcc.Store(id="store_presets", data={"Case1": {}}),
 
-    print(f"[create_embeddings] Saving reason_keys to {config.REASON_KEYS_NPY}")
-    np.save(config.REASON_KEYS_NPY, np.array(unique_keys, dtype=object))
+        # 現在のプリセット名の状態（UIで入力した名前を使う）
+        dcc.Store(id="store_current_preset", data="Case1"),
 
-    # 参考: reason_key を含むデータを保存しておく
-    output_csv = str(config.DATA_DIR / "removal_reasons_with_key.csv")
-    print(f"[create_embeddings] Saving dataframe with reason_key to {output_csv}")
-    df.to_csv(output_csv, index=False)
+        # テーブル描画領域
+        html.Div(id="table_area"),
 
-    print("[create_embeddings] Done.")
+        html.Div(id="msg", style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.85}),
+    ],
+)
 
+# ---------------------------
+# 4) 現在プリセット名を反映
+# ---------------------------
+@callback(
+    Output("store_current_preset", "data"),
+    Input("preset_name", "value"),
+)
+def sync_preset_name(name):
+    return (name or "").strip() or "Case1"
 
-if __name__ == "__main__":
-    create_embeddings()
-3-4. cluster_reviews.py
-K-means によるクラスタリングと、辞書ファイルの作成。
-（可視化は任意ですが、PCA で 2 次元に落として scatter を保存する簡易実装も入れておきます）
+# ---------------------------
+# 5) テーブル描画（プリセット内容を反映して html.Table を作り直す）
+# ---------------------------
+@callback(
+    Output("table_area", "children"),
+    Input("store_presets", "data"),
+    Input("store_current_preset", "data"),
+)
+def render_table(store_presets, current_preset):
+    presets = store_presets or {}
+    current = presets.get(current_preset, {})
+    return build_html_table(MASTER_ROWS, current)
 
---- code ---
+# ---------------------------
+# 6) raw を変えたら selected の options を追従させる（行ごと）
+#    ※ selected は raw の部分集合にしたい場合の必須処理
+# ---------------------------
+@callback(
+    Output({"type": "sel_dd", "row_id": ALL}, "options"),
+    Output({"type": "sel_dd", "row_id": ALL}, "value"),
+    Input({"type": "raw_dd", "row_id": ALL}, "value"),
+    State({"type": "sel_dd", "row_id": ALL}, "value"),
+)
+def sync_selected_options(all_raw_values, all_sel_values):
+    # ALLでまとめて来るので、行ごとに options/value を返す
+    new_options = []
+    new_values = []
 
-# cluster_reviews.py
-"""
-埋め込み (embeddings.npy) に対して K-means を実行し、
-- kmeans.joblib (モデル)
-- cluster_meta.json (cluster_id -> cluster_name)
-- reason_dict.json (reason_key -> {cluster_id, cluster_name})
-などを保存するスクリプト。
+    for raw_val, sel_val in zip(all_raw_values, all_sel_values):
+        raw_val = raw_val or []
+        sel_val = sel_val or []
 
-実行例:
-    python cluster_reviews.py --n_clusters 20
-"""
+        opts = raw_val if raw_val else ALL_LEVELS
+        # selected が raw に含まれない値を持っていたら落とす
+        filtered_sel = [x for x in sel_val if x in opts]
 
-import argparse
-import json
+        new_options.append([{"label": x, "value": x} for x in opts])
+        new_values.append(filtered_sel)
 
-import joblib
-import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
+    return new_options, new_values
 
-import config
+# ---------------------------
+# 7) 保存ボタンで Store に書き戻す（擬似追加/編集）
+# ---------------------------
+@callback(
+    Output("store_presets", "data"),
+    Output("msg", "children"),
+    Input("btn_save", "n_clicks"),
+    State("store_presets", "data"),
+    State("store_current_preset", "data"),
+    State({"type": "raw_dd", "row_id": ALL}, "id"),
+    State({"type": "raw_dd", "row_id": ALL}, "value"),
+    State({"type": "sel_dd", "row_id": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def save_to_store(n, store_presets, current_preset, raw_ids, raw_values, sel_values):
+    presets = store_presets or {}
+    presets.setdefault(current_preset, {})
 
-
-def train_kmeans(n_clusters: int = 20) -> None:
-    print("[cluster_reviews] Loading embeddings...")
-    embeddings = np.load(config.EMBEDDINGS_NPY)
-    reason_keys = np.load(config.REASON_KEYS_NPY, allow_pickle=True)
-
-    print(f"[cluster_reviews] embeddings shape: {embeddings.shape}")
-    print(f"[cluster_reviews] number of reason_keys: {len(reason_keys)}")
-
-    # KMeans 学習
-    print(f"[cluster_reviews] Training KMeans with n_clusters={n_clusters}...")
-    kmeans = KMeans(
-        n_clusters=n_clusters,
-        random_state=config.RANDOM_SEED,
-        n_init="auto",
-        max_iter=300,
-    )
-    kmeans.fit(embeddings)
-
-    # モデル保存
-    print(f"[cluster_reviews] Saving KMeans model to {config.KMEANS_MODEL}")
-    joblib.dump(kmeans, config.KMEANS_MODEL)
-
-    # 各 reason_key のクラスタ割当
-    labels = kmeans.predict(embeddings)
-
-    # cluster_id -> cluster_name (初期値は "cluster_00" など)
-    cluster_meta = {
-        int(cid): f"cluster_{int(cid):02d}"
-        for cid in range(n_clusters)
-    }
-
-    print(f"[cluster_reviews] Saving cluster_meta to {config.CLUSTER_META_JSON}")
-    with open(config.CLUSTER_META_JSON, "w", encoding="utf-8") as f:
-        json.dump(cluster_meta, f, ensure_ascii=False, indent=2)
-
-    # reason_key -> {cluster_id, cluster_name}
-    reason_dict = {}
-    for key, cid in zip(reason_keys, labels):
-        cid = int(cid)
-        reason_dict[str(key)] = {
-            "cluster_id": cid,
-            "cluster_name": cluster_meta.get(cid, f"cluster_{cid:02d}"),
+    for rid_obj, raw_val, sel_val in zip(raw_ids, raw_values, sel_values):
+        rid = rid_obj["row_id"]
+        presets[current_preset][rid] = {
+            "workscope_raw": raw_val or [],
+            "selected_workscope": sel_val or [],
+            "updated_at": now_iso(),
         }
 
-    print(f"[cluster_reviews] Saving reason_dict to {config.REASON_DICT_JSON}")
-    with open(config.REASON_DICT_JSON, "w", encoding="utf-8") as f:
-        json.dump(reason_dict, f, ensure_ascii=False, indent=2)
+    return presets, f'保存しました: preset="{current_preset}" / {len(raw_ids)}行'
 
-    # 任意: PCA 2 次元プロットを保存
-    try:
-        print("[cluster_reviews] Creating PCA visualization (optional)...")
-        pca = PCA(n_components=2, random_state=config.RANDOM_SEED)
-        emb_2d = pca.fit_transform(embeddings)
-
-        plt.figure(figsize=(8, 6))
-        plt.scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, s=10, alpha=0.7)
-        plt.title("KMeans clusters (PCA 2D)")
-        plt.xlabel("PC1")
-        plt.ylabel("PC2")
-        plt.tight_layout()
-
-        plot_path = config.MODELS_DIR / "clusters_pca.png"
-        plt.savefig(plot_path, dpi=150)
-        plt.close()
-        print(f"[cluster_reviews] Saved PCA plot to {plot_path}")
-    except Exception as e:
-        print(f"[cluster_reviews] PCA visualization failed (ignored): {e}")
-
-    print("[cluster_reviews] Done.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n_clusters", type=int, default=20)
-    args = parser.parse_args()
-
-    train_kmeans(n_clusters=args.n_clusters)
-3-5. inference.py
-ここでメインの predict_reason_category(text) と DataFrame 用の関数を用意します。
-
---- code ---
-
-# inference.py
-"""
-推論用モジュール。
-
-- predict_reason_category(text) -> dict
-- add_reason_category_to_df(df, text_col=...) -> df
-
-Dash からもインポートして利用できます。
-"""
-
-import json
-from functools import lru_cache
-from typing import Dict, Optional, Tuple
-
-import joblib
-import numpy as np
-import pandas as pd
-from sentence_transformers import SentenceTransformer
-
-import config
-from text_normalization import to_reason_key
-
-
-# -----------------------------
-# ロード系（キャッシュ付き）
-# -----------------------------
-
-@lru_cache(maxsize=1)
-def _load_sentence_model() -> SentenceTransformer:
-    print(f"[inference] Loading SentenceTransformer: {config.SENTENCE_MODEL_NAME}")
-    model = SentenceTransformer(config.SENTENCE_MODEL_NAME)
-    return model
-
-
-@lru_cache(maxsize=1)
-def _load_kmeans():
-    print(f"[inference] Loading KMeans model from {config.KMEANS_MODEL}")
-    return joblib.load(config.KMEANS_MODEL)
-
-
-@lru_cache(maxsize=1)
-def _load_cluster_meta() -> Dict[int, str]:
-    try:
-        with open(config.CLUSTER_META_JSON, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        return {int(k): str(v) for k, v in meta.items()}
-    except FileNotFoundError:
-        return {}
-
-
-@lru_cache(maxsize=1)
-def _load_reason_dict() -> Dict[str, Dict[str, object]]:
-    try:
-        with open(config.REASON_DICT_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-# -----------------------------
-# コア推論ロジック
-# -----------------------------
-
-def _predict_from_embedding_vector(
-    vec: np.ndarray,
-) -> Tuple[int, str]:
-    """
-    埋め込みベクトルから cluster_id, cluster_name を得る。
-    """
-    kmeans = _load_kmeans()
-    cluster_meta = _load_cluster_meta()
-
-    vec = vec.reshape(1, -1)
-    cid = int(kmeans.predict(vec)[0])
-    cname = cluster_meta.get(cid, f"cluster_{cid:02d}")
-    return cid, cname
-
-
-def _predict_from_reason_key(
-    reason_key: str,
-) -> Tuple[Optional[int], Optional[str], str]:
-    """
-    reason_key からクラスタを推論する。
-    戻り値: (cluster_id, cluster_name, source)
-        source: "dict" or "model" or "none"
-    """
-    reason_key = str(reason_key or "").strip()
-    if not reason_key:
-        return None, None, "none"
-
-    reason_dict = _load_reason_dict()
-
-    # 1) 既存辞書にあればそれを優先
-    if reason_key in reason_dict:
-        info = reason_dict[reason_key]
-        cid = int(info["cluster_id"])
-        cname = str(info["cluster_name"])
-        return cid, cname, "dict"
-
-    # 2) 無ければ Transformer + KMeans で推論
-    #    埋め込みは normalized reason_key 文字列に対して行う
-    model = _load_sentence_model()
-    emb = model.encode(
-        [reason_key],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )[0]
-
-    cid, cname = _predict_from_embedding_vector(emb)
-    return cid, cname, "model"
-
-
-def predict_reason_category(text: str) -> Dict[str, object]:
-    """
-    1 テキストに対して reason_key, cluster_id, cluster_name を返す関数。
-    戻り値例:
-        {
-            "reason_key": "high_pressure_turbine_blade_crack",
-            "cluster_id": 0,
-            "cluster_name": "blade_damage",
-            "source": "dict"  # or "model" or "none"
-        }
-    """
-    # まず正規化して reason_key を作る
-    reason_key = to_reason_key(text, use_abbrev=True)
-
-    cid, cname, source = _predict_from_reason_key(reason_key)
-
-    return {
-        "reason_key": reason_key,
-        "cluster_id": cid,
-        "cluster_name": cname,
-        "source": source,
+# ---------------------------
+# 8) JSONエクスポート（ローカル保存用）
+# ---------------------------
+@callback(
+    Output("dl_json", "data"),
+    Input("btn_export", "n_clicks"),
+    State("store_presets", "data"),
+    prevent_initial_call=True,
+)
+def export_json(n, presets):
+    payload = {
+        "version": 1,
+        "exported_at": now_iso(),
+        "presets": presets or {},
     }
-
-
-# -----------------------------
-# DataFrame 用ユーティリティ
-# -----------------------------
-
-def add_reason_category_to_df(
-    df: pd.DataFrame,
-    text_col: str | None = None,
-    reason_key_col: str | None = None,
-    cluster_id_col: str | None = None,
-    cluster_name_col: str | None = None,
-    reason_category_col: str | None = None,
-) -> pd.DataFrame:
-    """
-    DataFrame に reason_key / cluster_id / cluster_name / reason_category 列を追加する。
-
-    - reason_category は cluster_name と同じ内容を持たせる想定。
-    - 内部で重複する reason_key はまとめて推論し、パフォーマンスを確保する。
-    """
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-    if reason_key_col is None:
-        reason_key_col = config.REASON_KEY_COLUMN
-    if cluster_id_col is None:
-        cluster_id_col = config.CLUSTER_ID_COLUMN
-    if cluster_name_col is None:
-        cluster_name_col = config.CLUSTER_NAME_COLUMN
-    if reason_category_col is None:
-        reason_category_col = config.REASON_CATEGORY_COLUMN
-
-    df = df.copy()
-
-    # 1) reason_key を付与（既にあれば再利用）
-    if reason_key_col not in df.columns:
-        from text_normalization import add_reason_key as _add_reason_key
-        df = _add_reason_key(df, text_col=text_col, reason_key_col=reason_key_col)
-
-    # 2) ユニークな reason_key ごとにクラスタを推論
-    reason_keys = (
-        df[reason_key_col]
-        .fillna("")
-        .astype(str)
-        .tolist()
+    return dict(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        filename=f"presets_{now_iso().replace(':','-')}.json",
+        type="application/json",
     )
-    unique_keys = sorted(set(reason_keys))
-
-    key_to_result: Dict[str, Dict[str, object]] = {}
-    for key in unique_keys:
-        if key not in key_to_result:
-            cid, cname, source = _predict_from_reason_key(key)
-            key_to_result[key] = {
-                "cluster_id": cid,
-                "cluster_name": cname,
-                "source": source,
-            }
-
-    # 3) DataFrame に展開
-    cluster_ids = []
-    cluster_names = []
-    for key in reason_keys:
-        info = key_to_result.get(key, {"cluster_id": None, "cluster_name": None})
-        cluster_ids.append(info["cluster_id"])
-        cluster_names.append(info["cluster_name"])
-
-    df[cluster_id_col] = cluster_ids
-    df[cluster_name_col] = cluster_names
-    df[reason_category_col] = cluster_names  # Dash で使うカテゴリー列
-
-    return df
-3-6. preprocess_for_dash.py
-事前処理で CSV に reason_category を追加して保存するスクリプト。
-
---- code ---
-
-# preprocess_for_dash.py
-"""
-Dash に渡す前に、CSV に reason_category を付与して保存するスクリプト。
-
-実行例:
-    python preprocess_for_dash.py \
-        --input data/removal_reasons.csv \
-        --output data/removal_reasons_with_category.csv
-"""
-
-import argparse
-
-import pandas as pd
-
-import config
-from inference import add_reason_category_to_df
-
-
-def preprocess_for_dash(
-    input_csv: str,
-    output_csv: str,
-) -> None:
-    print(f"[preprocess_for_dash] Loading: {input_csv}")
-    df = pd.read_csv(input_csv)
-
-    print("[preprocess_for_dash] Adding reason_category columns...")
-    df_out = add_reason_category_to_df(df, text_col=config.TEXT_COLUMN)
-
-    print(f"[preprocess_for_dash] Saving to: {output_csv}")
-    df_out.to_csv(output_csv, index=False)
-
-    print("[preprocess_for_dash] Done.")
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default=str(config.INPUT_CSV))
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=str(config.DATA_DIR / "removal_reasons_with_category.csv"),
-    )
-
-    args = parser.parse_args()
-    preprocess_for_dash(args.input, args.output)
-3-7. reason_category_pipeline.py（Dash 用・test_df に列を追加）
-最後に、あなたの Dash アプリ側から簡単に呼べる 専用モジュール を用意します。
-ここで test_df（データ取得コンポーネントが返す DataFrame）に対し、前処理＋カテゴリー列追加を行います。
-
---- code ---
-
-# reason_category_pipeline.py
-"""
-Dash アプリから利用するための薄いラッパーモジュール。
-
-想定利用例（Dash のコールバックなど）:
-
-    from reason_category_pipeline import enrich_with_reason_category
-
-    def get_data():
-        test_df = ...  # どこかから DataFrame を取得
-        test_df = enrich_with_reason_category(test_df, text_col="removal_reason")
-        return test_df
-
-"""
-
-from typing import Optional
-
-import pandas as pd
-
-import config
-from inference import add_reason_category_to_df
-
-
-def enrich_with_reason_category(
-    df: pd.DataFrame,
-    text_col: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Dash で使う test_df に reason_key / cluster_id / cluster_name / reason_category を追加する。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        取得した生データ DataFrame (例: test_df)
-    text_col : str, optional
-        クラスタリング対象のテキスト列名。
-        None の場合は config.TEXT_COLUMN を使用。
-
-    Returns
-    -------
-    pd.DataFrame
-        新たな列が追加された DataFrame
-    """
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-
-    # inference.add_reason_category_to_df をそのまま利用
-    enriched_df = add_reason_category_to_df(df, text_col=text_col)
-
-    return enriched_df
-4. Dash への統合アドバイス
-4-1. 事前にやっておくこと
-一度だけ以下を順番に実行しておく：
-
-python create_embeddings.py
-
-python cluster_reviews.py --n_clusters 20（クラスタ数は調整）
-
-必要なら models/cluster_meta.json を開いて、cluster_id: "blade_damage" など、人間が分かる名前 に手動修正する。
-
-python preprocess_for_dash.py で事前処理済み CSV を作成するか、
-もしくは Dash 側で reason_category_pipeline.enrich_with_reason_category を呼んで動的に列追加する。
-
-4-2. Dash コード側のイメージ
-# 例: Dash データ取得部分
-from reason_category_pipeline import enrich_with_reason_category
-
-def get_test_df() -> pd.DataFrame:
-    # ここは既存のロジックでデータ取得
-    test_df = fetch_data_from_somewhere()
-
-    # removal_reason 列に基づいてカテゴリー列を付与
-    test_df = enrich_with_reason_category(test_df, text_col="removal_reason")
-
-    return test_df
-
-# Layout 例: checklist に cluster_name / reason_category を使う
-import dash
-from dash import dcc, html
-
-app = dash.Dash(__name__)
-
-df = get_test_df()
-unique_categories = sorted(df["reason_category"].dropna().unique())
-
-app.layout = html.Div([
-    dcc.Checklist(
-        id="reason-category-filter",
-        options=[{"label": c, "value": c} for c in unique_categories],
-        value=[],
-    ),
-    # 他のコンポーネント…
-])
-apply_all_filters() 側で、
-"reason_category": "cluster_name" のように、reason_category 列を使うフィルタ条件を追加すれば OK です。
-
-5. 新規データが来る場合の運用フロー
-モデル学習済み前提
-
-create_embeddings.py & cluster_reviews.py を済ませておく（埋め込みと KMeans を固定）。
-
-新規データ到着
-
-Dash が問い合わせて test_df を作る。
-
-reason_category_pipeline.enrich_with_reason_category(test_df) を呼ぶ。
-
-内部処理フロー
-
-enrich_with_reason_category → add_reason_category_to_df
-
-正規化 + reason_key 作成
-
-既知の reason_key なら reason_dict.json からクラスタ名を取得
-
-未知の reason_key は Transformer で埋め込み → KMeans で最近傍クラスタ → cluster_id / cluster_name 割り当て
-
-辞書の更新（任意）
-
-未知 reason_key がある程度溜まったら、
-
-ログから新しい reason_key とクラスタ ID を集計し、
-
-reason_dict.json に手動で追記（あるいは管理スクリプトを書く）することで、
-次回からは辞書ヒット優先で高速・安定になる。
-
-6. 今後改善すると良さそうなポイント
-正規化の高度化
-
-今はかなり簡易な s 問題対応なので、業務で実際に出る語彙に合わせて例外辞書（複数形の保持/除去）を整備すると精度が上がります。
-
-spaCy や NLTK のレマタイザを導入するのも選択肢です（ただし依存増加）。
-
-略語辞書の拡充
-
-abbrev_patterns.csv による展開は強力なので、ドメイン固有の略語を継続的に追加していく運用がオススメです。
-
-クラスタ数の自動選択
-
-今は固定 n_clusters ですが、Elbow 法や Silhouette Score を使って最適クラスタ数をざっくり見積もるスクリプトを追加可能です。
-
-クラスタ名の自動命名（半自動）
-
-各クラスタ中心付近のサンプルを見て、頻出単語から自動的に候補名を作る処理を入れると、ラベリング作業が楽になります。
-
-パフォーマンス
-
-現状でも
-
-モデルは LRU キャッシュで 1 回だけロード
-
-reason_key 単位で推論
-をしているのでかなり実用的ですが、アクセスが非常に多い場合は
-
-reason_dict.json に新しいキーを逐次追加してキャッシュする
-
-FastAPI などで推論 API として切り出して Dash から叩く
-といった構成も検討できます。
-
-もし「略語 CSV のサンプル」や「Dash の apply_all_filters 部分への組み込みコード」も具体例が欲しければ、それも書き足せます 👍
-
-あなた:
-前処理はきちんとしたうえでtfidfとkmeanでカテゴリーを決めて適用するだけの場合は？
-またkmeanの後にはカテゴリー名などを決めるために一度それを探索するフェーズが必要では？
-推論は今は不要
-ChatGPT:
-
-思考時間: 59s
-やることかなりシンプルになります 👍
-「ちゃんと前処理したテキスト → TF-IDF → KMeans でクラスタ → クラスタを人間が眺めて名前を決める → そのラベルを DataFrame に貼る」だけです。
-
-推論（新規テキストにクラスタを当てる）はいったん忘れます。
-
-全体像（TF-IDF + KMeans 版）
-前処理
-
-小文字化・記号除去・簡易レマタイザ（s 問題）・略語展開
-
-"high_pressure_turbine_blade_crack" のような reason_key を作る
-
-TF-IDF + KMeans
-
-reason_key 列を TfidfVectorizer でベクトル化
-
-KMeans でクラスタリング
-
-得られた cluster_id を DataFrame に付与
-
-クラスタ探索フェーズ（重要）
-
-各クラスタごとの
-
-上位 TF-IDF 単語
-
-代表サンプル（元の removal_reason）
-
-を CSV やログで出して、人間が「これは blade_damage」「これは oil_system」など名前付け
-
-クラスタ名をファイルに書く
-
-例：cluster_meta.json に
-{0: "blade_damage", 1: "oil_system", ...} を保存
-
-クラスタ名を DataFrame に適用
-
-cluster_id → cluster_name をマッピングして
-
-reason_category 列として Dash で使えるようにして CSV 保存
-
-Dash 側
-
-その CSV を読み込んで
-
-reason_category をチェックリストフィルタに使う
-
-フォルダ構成（TF-IDF 版）
-project_root/
-├─ data/
-│   ├─ removal_reasons.csv        # 元データ
-│   └─ abbrev_patterns.csv        # 略語辞書
-├─ models/
-│   ├─ tfidf_vectorizer.joblib    # TF-IDF Vectorizer
-│   ├─ kmeans_tfidf.joblib        # KMeans モデル
-│   ├─ cluster_meta.json          # cluster_id -> cluster_name
-│   └─ cluster_explore.csv        # 各クラスタの中身サマリ
-├─ config.py
-├─ text_normalization.py          # 正規化・略語適用・reason_key 作成
-├─ cluster_tfidf.py               # TF-IDF + KMeans + クラスタ探索
-├─ preprocess_for_dash.py         # reason_category を付与した CSV を作る
-└─ reason_category_pipeline.py    # （任意）Dash 内の test_df に列を付ける関数
-1. config.py
---- code ---
-
-# config.py
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-
-DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-# 入出力ファイル
-INPUT_CSV = DATA_DIR / "removal_reasons.csv"
-ABBREV_CSV = DATA_DIR / "abbrev_patterns.csv"
-
-TFIDF_VECTORIZER_PATH = MODELS_DIR / "tfidf_vectorizer.joblib"
-KMEANS_MODEL_PATH = MODELS_DIR / "kmeans_tfidf.joblib"
-CLUSTER_META_JSON = MODELS_DIR / "cluster_meta.json"
-CLUSTER_EXPLORE_CSV = MODELS_DIR / "cluster_explore.csv"
-
-# 列名
-TEXT_COLUMN = "removal_reason"
-REASON_KEY_COLUMN = "reason_key"
-CLUSTER_ID_COLUMN = "cluster_id"
-CLUSTER_NAME_COLUMN = "cluster_name"
-REASON_CATEGORY_COLUMN = "reason_category"
-
-# 再現性
-RANDOM_SEED = 42
-2. 前処理：text_normalization.py
-※ここは前回案とほぼ同じ。SentenceTransformer 関係を削ったバージョン。
-
---- code ---
-
-# text_normalization.py
-import re
-import unicodedata
-from functools import lru_cache
-from typing import List, Tuple, Optional
-
-import numpy as np
-import pandas as pd
-
-import config
-
-
-# -----------------------------
-# 略語辞書
-# -----------------------------
-
-def load_abbrev_patterns(csv_path: Optional[str] = None) -> List[Tuple[re.Pattern, str]]:
-    """
-    abbrev_patterns.csv を読み込み、(regex, replacement) のリストとして返す。
-
-    CSV 例:
-        pattern,replacement
-        HPT,high pressure turbine
-        LPT,low pressure turbine
-    """
-    if csv_path is None:
-        csv_path = config.ABBREV_CSV
-
-    df = pd.read_csv(csv_path)
-
-    if "pattern" not in df.columns or "replacement" not in df.columns:
-        raise ValueError("abbrev_patterns.csv には 'pattern', 'replacement' 列が必要です。")
-
-    patterns: List[Tuple[re.Pattern, str]] = []
-    for _, row in df.iterrows():
-        pat = str(row["pattern"]).strip().lower()
-        repl = str(row["replacement"]).strip().lower()
-        # 単語境界でマッチ
-        pat_re = re.compile(r"\b" + re.escape(pat) + r"\b")
-        patterns.append((pat_re, repl))
-    return patterns
-
-
-@lru_cache(maxsize=1)
-def _cached_abbrev_patterns() -> List[Tuple[re.Pattern, str]]:
-    try:
-        return load_abbrev_patterns()
-    except FileNotFoundError:
-        return []
-
-
-def apply_abbrev_to_text(text: str,
-                         patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    if not isinstance(text, str):
-        text = "" if pd.isna(text) else str(text)
-
-    lowered = unicodedata.normalize("NFKC", text).lower()
-    if patterns is None:
-        patterns = _cached_abbrev_patterns()
-
-    for pat, repl in patterns:
-        lowered = pat.sub(repl, lowered)
-    return lowered
-
-
-# -----------------------------
-# s 問題を含む簡易レマタイザ
-# -----------------------------
-
-def _simple_lemma(token: str) -> str:
-    if len(token) <= 3:
-        return token
-
-    if token.endswith("ies") and len(token) > 4:
-        return token[:-3] + "y"
-
-    if token.endswith("es") and len(token) > 4:
-        return token[:-2]
-
-    if token.endswith("s"):
-        return token[:-1]
-
-    return token
-
-
-def _remove_punctuation(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = text.replace("_", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def normalize_text_basic(text: str,
-                         use_abbrev: bool = True,
-                         patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    """
-    - 小文字化
-    - 略語展開
-    - 記号除去
-    - s 問題の簡易レマタイザ
-    """
-    if not isinstance(text, str):
-        text = "" if pd.isna(text) else str(text)
-
-    text = unicodedata.normalize("NFKC", text).lower()
-
-    if use_abbrev:
-        text = apply_abbrev_to_text(text, patterns=patterns)
-
-    text = _remove_punctuation(text)
-    if not text:
-        return ""
-
-    tokens = text.split()
-    lemmas = [_simple_lemma(tok) for tok in tokens]
-    return " ".join(lemmas)
-
-
-def to_reason_key(text: str,
-                  use_abbrev: bool = True,
-                  patterns: Optional[List[Tuple[re.Pattern, str]]] = None) -> str:
-    normalized = normalize_text_basic(text, use_abbrev=use_abbrev, patterns=patterns)
-    if not normalized:
-        return ""
-    return normalized.replace(" ", "_")
-
-
-def add_reason_key(df: pd.DataFrame,
-                   text_col: str | None = None,
-                   reason_key_col: str | None = None,
-                   abbrev_csv_path: Optional[str] = None) -> pd.DataFrame:
-    """
-    DataFrame に reason_key 列を追加する。
-    """
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-    if reason_key_col is None:
-        reason_key_col = config.REASON_KEY_COLUMN
-
-    df = df.copy()
-
-    patterns = None
-    if abbrev_csv_path is not None:
-        patterns = load_abbrev_patterns(abbrev_csv_path)
-
-    texts = df[text_col].astype("object").to_numpy()
-
-    keys = [
-        to_reason_key(text, use_abbrev=True, patterns=patterns)
-        for text in texts
-    ]
-
-    df[reason_key_col] = keys
-    return df
-3. TF-IDF + KMeans + クラスタ探索：cluster_tfidf.py
-ここが今回の メイン です。
-
-add_reason_key で正規化
-
-TfidfVectorizer で reason_key をベクトル化
-
-KMeans でクラスタリング
-
-各クラスタの
-
-上位単語
-
-代表的なサンプルテキスト
-
-を cluster_explore.csv に出力 → これを見ながら人間が名前を決める
-
---- code ---
-
-# cluster_tfidf.py
-"""
-TF-IDF + KMeans でクラスタを作り、
-クラスタの中身を探索するための情報を CSV に落とすスクリプト。
-
-実行例:
-    python cluster_tfidf.py --n_clusters 20
-"""
-
-import argparse
-import json
-
-import joblib
-import numpy as np
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-
-import config
-from text_normalization import add_reason_key
-
-
-def run_clustering_tfidf(n_clusters: int = 20,
-                         min_df: int = 3,
-                         max_features: int = 5000) -> None:
-    print(f"[cluster_tfidf] Loading data from {config.INPUT_CSV}")
-    df = pd.read_csv(config.INPUT_CSV)
-
-    # 1) reason_key 付与（正規化）
-    print("[cluster_tfidf] Adding reason_key...")
-    df = add_reason_key(df, text_col=config.TEXT_COLUMN,
-                        reason_key_col=config.REASON_KEY_COLUMN)
-
-    # 2) TF-IDF ベクトル化
-    print("[cluster_tfidf] Vectorizing with TF-IDF...")
-    vectorizer = TfidfVectorizer(
-        analyzer="word",
-        ngram_range=(1, 2),
-        min_df=min_df,
-        max_features=max_features,
-    )
-    X = vectorizer.fit_transform(df[config.REASON_KEY_COLUMN].fillna(""))
-
-    print(f"[cluster_tfidf] TF-IDF matrix shape: {X.shape}")
-
-    # 3) KMeans クラスタリング
-    print(f"[cluster_tfidf] Fitting KMeans (n_clusters={n_clusters})...")
-    kmeans = KMeans(
-        n_clusters=n_clusters,
-        random_state=config.RANDOM_SEED,
-        n_init="auto",
-        max_iter=300,
-    )
-    kmeans.fit(X)
-    labels = kmeans.labels_
-
-    df[config.CLUSTER_ID_COLUMN] = labels
-
-    # 4) モデル保存（後で Dash で使いたくなったときのため）
-    print(f"[cluster_tfidf] Saving TF-IDF vectorizer to {config.TFIDF_VECTORIZER_PATH}")
-    joblib.dump(vectorizer, config.TFIDF_VECTORIZER_PATH)
-
-    print(f"[cluster_tfidf] Saving KMeans model to {config.KMEANS_MODEL_PATH}")
-    joblib.dump(kmeans, config.KMEANS_MODEL_PATH)
-
-    # 5) クラスタ探索用 CSV を作る
-    print("[cluster_tfidf] Preparing cluster exploration summary...")
-
-    terms = np.array(vectorizer.get_feature_names_out())
-    centers = kmeans.cluster_centers_
-    order_centroids = centers.argsort(axis=1)[:, ::-1]  # 各クラスタで重みが大きい順
-
-    rows = []
-    for cid in range(n_clusters):
-        cluster_mask = (labels == cid)
-        cluster_df = df[cluster_mask]
-
-        # 上位単語
-        top_term_indices = order_centroids[cid][:15]
-        top_terms = terms[top_term_indices].tolist()
-        top_terms_str = ", ".join(top_terms)
-
-        # 代表サンプル（元テキスト）をいくつか
-        sample_texts = cluster_df[config.TEXT_COLUMN].dropna().astype(str).head(10).tolist()
-        sample_texts_str = " || ".join(sample_texts)
-
-        rows.append({
-            "cluster_id": cid,
-            "n_samples": int(cluster_mask.sum()),
-            "top_terms": top_terms_str,
-            "sample_texts": sample_texts_str,
-        })
-
-    explore_df = pd.DataFrame(rows)
-    print(f"[cluster_tfidf] Saving exploration CSV to {config.CLUSTER_EXPLORE_CSV}")
-    explore_df.to_csv(config.CLUSTER_EXPLORE_CSV, index=False)
-
-    # 6) 初期の cluster_meta.json（名前は仮）
-    cluster_meta = {int(cid): f"cluster_{cid:02d}" for cid in range(n_clusters)}
-    print(f"[cluster_tfidf] Saving initial cluster_meta to {config.CLUSTER_META_JSON}")
-    with open(config.CLUSTER_META_JSON, "w", encoding="utf-8") as f:
-        json.dump(cluster_meta, f, ensure_ascii=False, indent=2)
-
-    # 7) クラスタ付き DataFrame も保存（任意）
-    output_csv = config.DATA_DIR / "removal_reasons_with_cluster_id.csv"
-    print(f"[cluster_tfidf] Saving dataframe with cluster_id to {output_csv}")
-    df.to_csv(output_csv, index=False)
-
-    print("[cluster_tfidf] Done.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n_clusters", type=int, default=20)
-    parser.add_argument("--min_df", type=int, default=3)
-    parser.add_argument("--max_features", type=int, default=5000)
-    args = parser.parse_args()
-
-    run_clustering_tfidf(
-        n_clusters=args.n_clusters,
-        min_df=args.min_df,
-        max_features=args.max_features,
-    )
-🔍 クラスタ探索フェーズの流れ
-python cluster_tfidf.py --n_clusters 20 を実行
-
-models/cluster_explore.csv を開くと、各 cluster_id ごとに
-
-top_terms（そのクラスタを代表する単語）
-
-sample_texts（代表的な元の removal_reason）
-が見える
-
-それを見ながら、models/cluster_meta.json を 手動で編集 して
-
-{
-  "0": "blade_damage",
-  "1": "oil_system",
-  ...
-}
-のように人が意味のある名前を付ける
-→ これで「カテゴリー名決定フェーズ」が完了です。
-
-4. Dash 用 CSV を作る：preprocess_for_dash.py
-ここでは：
-
-removal_reasons_with_cluster_id.csv を読み込む
-
-編集済み cluster_meta.json を読み込む
-
-cluster_id → cluster_name を付けて reason_category にする
-
-Dash 用 CSV を書き出す
-
---- code ---
-
-# preprocess_for_dash.py
-"""
-クラスタ ID と cluster_meta.json に基づき、
-cluster_name / reason_category 列を付けた CSV を作るスクリプト。
-
-実行例:
-    python preprocess_for_dash.py \
-        --input data/removal_reasons_with_cluster_id.csv \
-        --output data/removal_reasons_with_category.csv
-"""
-import argparse
-import json
-
-import pandas as pd
-
-import config
-
-
-def add_cluster_name_and_category(
-    df: pd.DataFrame,
-    cluster_meta_path: str | None = None,
-) -> pd.DataFrame:
-    if cluster_meta_path is None:
-        cluster_meta_path = config.CLUSTER_META_JSON
-
-    with open(cluster_meta_path, "r", encoding="utf-8") as f:
-        cluster_meta = json.load(f)
-
-    # 数値・文字列両方に対応
-    cluster_meta_int = {int(k): str(v) for k, v in cluster_meta.items()}
-
-    df = df.copy()
-    df[config.CLUSTER_NAME_COLUMN] = df[config.CLUSTER_ID_COLUMN].map(cluster_meta_int)
-    df[config.REASON_CATEGORY_COLUMN] = df[config.CLUSTER_NAME_COLUMN]
-    return df
-
-
-def main(input_csv: str, output_csv: str) -> None:
-    print(f"[preprocess_for_dash] Loading: {input_csv}")
-    df = pd.read_csv(input_csv)
-
-    print("[preprocess_for_dash] Adding cluster_name / reason_category...")
-    df = add_cluster_name_and_category(df)
-
-    print(f"[preprocess_for_dash] Saving to: {output_csv}")
-    df.to_csv(output_csv, index=False)
-
-    print("[preprocess_for_dash] Done.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--input",
-        type=str,
-        default=str(config.DATA_DIR / "removal_reasons_with_cluster_id.csv"),
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=str(config.DATA_DIR / "removal_reasons_with_category.csv"),
-    )
-    args = parser.parse_args()
-
-    main(args.input, args.output)
-5. Dash から使うための関数（別ファイル）
-「データを取得するコンポーネントで test_df としてデータを取得しており、その中の文字列を含む列にカテゴリー列を上記の前処理、カテゴリー化をした上で追加するような関数を別ファイルに」
-
-バッチ処理前提なら「Dash ではすでに reason_category 付き CSV を読む」だけで済みますが、
-「Dash 内でも同じロジックで一発で付けたい」こともあると思うので、ラッパー関数も用意しておきます。
-
-※ここでは「新規データ推論」というより「そのときの test_df に対して TF-IDF + KMeans を Fit & Predict する一括処理」です（モデル保存・再利用はしない版に変更してもOK）。
-
-ここでは、すでに TF-IDF & KMeans を学習済み（cluster_tfidf.py 済み）とし、
-保存済みモデル & cluster_meta.json を使って test_df にカテゴリを付ける関数にしておきます。
-（将来的に「真の推論」が欲しくなったら、そのまま再利用できます）
-
---- code ---
-
-# reason_category_pipeline.py
-"""
-Dash から利用するための薄いラッパー。
-
-test_df に対し、既存の TF-IDF + KMeans + cluster_meta を使って
-cluster_id / cluster_name / reason_category を付ける。
-"""
-
-from typing import Optional
-import json
-
-import joblib
-import pandas as pd
-
-import config
-from text_normalization import add_reason_key
-
-
-def enrich_with_reason_category(
-    df: pd.DataFrame,
-    text_col: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    取得した test_df に、
-    reason_key / cluster_id / cluster_name / reason_category を追加する。
-
-    ※ 前提:
-        - models/tfidf_vectorizer.joblib
-        - models/kmeans_tfidf.joblib
-        - models/cluster_meta.json
-      が存在し、クラスター名が設定済であること。
-    """
-    if text_col is None:
-        text_col = config.TEXT_COLUMN
-
-    df = df.copy()
-
-    # 1) reason_key 付与
-    df = add_reason_key(df, text_col=text_col,
-                        reason_key_col=config.REASON_KEY_COLUMN)
-
-    # 2) モデル & メタ読み込み
-    vectorizer = joblib.load(config.TFIDF_VECTORIZER_PATH)
-    kmeans = joblib.load(config.KMEANS_MODEL_PATH)
-
-    with open(config.CLUSTER_META_JSON, "r", encoding="utf-8") as f:
-        cluster_meta = json.load(f)
-    cluster_meta_int = {int(k): str(v) for k, v in cluster_meta.items()}
-
-    # 3) TF-IDF 化 & 予測
-    X = vectorizer.transform(df[config.REASON_KEY_COLUMN].fillna(""))
-    labels = kmeans.predict(X)
-    df[config.CLUSTER_ID_COLUMN] = labels
-
-    # 4) クラスタ名 & カテゴリ列
-    df[config.CLUSTER_NAME_COLUMN] = df[config.CLUSTER_ID_COLUMN].map(cluster_meta_int)
-    df[config.REASON_CATEGORY_COLUMN] = df[config.CLUSTER_NAME_COLUMN]
-
-    return df
-Dash 側からのイメージ：
-
-# どこかのデータ取得コンポーネントで
-from reason_category_pipeline import enrich_with_reason_category
-
-def get_test_df():
-    test_df = fetch_data_somehow()  # 既存の処理
-    test_df = enrich_with_reason_category(test_df, text_col="removal_reason")
-    return test_df
-6. まとめ：KMeans 後の「探索フェーズ」は必須？
-はい、（ほぼ）必須だと思っておく方が安全です。
-
-KMeans は「この点群を n 個の塊に分けました」しか教えてくれない
-
-「クラスタ 0 はブレード損傷、クラスタ 1 はオイル系統」といった意味付けは、
-各クラスタに含まれるサンプルを人間が眺めて決めるプロセス が必要
-
-そのために
-
-上位 TF-IDF 単語 (top_terms)
-
-代表サンプル (sample_texts)
-を吐き出す cluster_explore.csv のようなものを作っておくのが定番パターン
-
-今回の構成だと：
-
-cluster_tfidf.py でクラスタリング & cluster_explore.csv 作成
-
-cluster_explore.csv を見ながら cluster_meta.json を編集してカテゴリー名を決める
-
-preprocess_for_dash.py で reason_category 付き CSV を作成
-
-Dash でその CSV を読み込み、reason_category をフィルタに使う
-
-という運用になります。
-
-もし「cluster_explore.csv の中身をもう少しリッチにしたい（クラスタごとの件数ランキングや可視化など）」という要望が出てきたら、その部分だけ拡張してあげれば OK です。
-
-
-
-
-Keine ausgewähltKeine ausgewählt
-ChatGPT の回答は必ずしも正しいとは限りません。重要な情報は確認するようにしてください。cookie の設定を参照してください。
+    app.run_server(debug=True)
