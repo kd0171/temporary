@@ -3,7 +3,8 @@ import copy
 import json
 from datetime import datetime
 
-from dash import Dash, html, dcc, Input, Output, State, ALL, callback, no_update, ctx
+from dash import Dash, html, dcc
+from dash import Input, Output, State, ALL, callback, no_update, ctx
 
 app = Dash(__name__)
 
@@ -15,6 +16,8 @@ MASTER_ROWS = [
     {"engine_type": "V2500", "partnumber": "72-31-00", "partname": "Fan Module"},
     {"engine_type": "V2500", "partnumber": "72-32-00", "partname": "Intermediate Case Module"},
 ]
+
+# 選択候補（必要ならここをあなたの候補に）
 ALL_LEVELS = ["LEVEL 1", "LEVEL 2", "LEVEL 2.1", "LEVEL 2.9", "LEVEL 3"]
 
 
@@ -41,11 +44,13 @@ def unique_name(existing: set[str], base: str) -> str:
 
 
 def empty_store():
+    # store_presets["presets"] は dict: {preset_name: {"meta":..., "rows":{row_id:{...}}}}
     return {"version": 1, "updated_at": now_iso(), "presets": {}}
 
 
 # ---------------------------
-# html.Table 組み立て
+# html.Table（デザインは前の感じに戻す）
+# - selected workscope は raw に制限しない（両方ALL_LEVELSから自由に選べる）
 # ---------------------------
 def build_html_table(master_rows, preset_rows_cfg: dict):
     header = html.Thead(
@@ -61,9 +66,15 @@ def build_html_table(master_rows, preset_rows_cfg: dict):
     )
 
     body_rows = []
+    td_style = {
+        "border": "1px solid #ddd",
+        "padding": "6px",
+        "verticalAlign": "top",
+    }
+
     for r in master_rows:
         rid = make_row_id(r)
-        cfg = preset_rows_cfg.get(rid, {}) or {}
+        cfg = (preset_rows_cfg or {}).get(rid, {}) or {}
         raw_val = cfg.get("workscope_raw", []) or []
         sel_val = cfg.get("selected_workscope", []) or []
 
@@ -75,17 +86,14 @@ def build_html_table(master_rows, preset_rows_cfg: dict):
             id={"type": "raw_dd", "row_id": rid},
         )
 
-        # selected は raw の部分集合にしたいなら options を raw に合わせる
-        sel_opts = raw_val if raw_val else ALL_LEVELS
         sel_dd = dcc.Dropdown(
-            options=[{"label": x, "value": x} for x in sel_opts],
-            value=[x for x in sel_val if x in sel_opts],
+            options=[{"label": x, "value": x} for x in ALL_LEVELS],
+            value=sel_val,
             multi=True,
             placeholder="selected を選択",
             id={"type": "sel_dd", "row_id": rid},
         )
 
-        td_style = {"border": "1px solid #ddd", "padding": "6px", "verticalAlign": "top"}
         body_rows.append(
             html.Tr(
                 [
@@ -105,72 +113,114 @@ def build_html_table(master_rows, preset_rows_cfg: dict):
 
 
 # ---------------------------
-# Layout
+# Layout（新規/既存を分ける）
 # ---------------------------
+box_style = {
+    "border": "1px solid #eee",
+    "borderRadius": "10px",
+    "padding": "12px",
+    "background": "#fafafa",
+}
+
 app.layout = html.Div(
     style={"maxWidth": "1300px", "margin": "0 auto", "padding": "12px"},
     children=[
         html.H3("Pre-Selection (html.Table + Presets + Local Store)"),
+
         # 永続 Store（localStorage）
         dcc.Store(id="store_presets", storage_type="local", data=empty_store()),
         dcc.Store(id="store_current_preset", storage_type="local", data=None),
-        # 「作成/インポート後にこのプリセットを選択したい」などの指示用（重複Output回避）
-        dcc.Store(id="store_action", storage_type="memory", data={}),
+
+        # 削除確認ポップアップ
+        dcc.ConfirmDialog(
+            id="confirm_delete",
+            message="このプリセットを削除します。よろしいですか？",
+        ),
+
         html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
+            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "12px"},
             children=[
+                # --- 新規 ---
                 html.Div(
-                    [
-                        html.Label("Preset切替"),
-                        dcc.Dropdown(
-                            id="dd_preset",
-                            options=[],
-                            value=None,
-                            clearable=False,
-                            style={"width": "320px"},
+                    style=box_style,
+                    children=[
+                        html.Div(
+                            style={"fontWeight": 700, "marginBottom": "8px"},
+                            children="新規（作成 / 取り込み）",
                         ),
-                    ]
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                            children=[
+                                dcc.Input(
+                                    id="inp_new_preset",
+                                    placeholder="新規プリセット名 (例: Case1)",
+                                    type="text",
+                                    style={"width": "280px"},
+                                ),
+                                html.Button("新規プリセット作成", id="btn_create", n_clicks=0),
+                                # 「新規として保存」＝今の表の値を、この名前のプリセットとして保存（未作成なら作って保存）
+                                html.Button("この名前で保存", id="btn_save_new", n_clicks=0),
+                                dcc.Upload(
+                                    id="upload_json",
+                                    children=html.Div(["JSONアップロード（追加）"]),
+                                    style={
+                                        "width": "260px",
+                                        "height": "38px",
+                                        "lineHeight": "38px",
+                                        "borderWidth": "1px",
+                                        "borderStyle": "dashed",
+                                        "borderRadius": "6px",
+                                        "textAlign": "center",
+                                        "cursor": "pointer",
+                                        "background": "white",
+                                    },
+                                    multiple=False,
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            style={"fontSize": "12px", "opacity": 0.8, "marginTop": "6px"},
+                            children="※ アップロードは store(local) に追加されます（同名は自動リネーム）",
+                        ),
+                    ],
                 ),
+
+                # --- 既存 ---
                 html.Div(
-                    [
-                        html.Label("新規プリセット名"),
-                        dcc.Input(
-                            id="inp_new_preset",
-                            placeholder="例: Case1",
-                            type="text",
-                            style={"width": "240px"},
+                    style=box_style,
+                    children=[
+                        html.Div(
+                            style={"fontWeight": 700, "marginBottom": "8px"},
+                            children="既存（切替 / 更新 / 出力 / 削除）",
                         ),
-                    ]
-                ),
-                html.Button("新規作成", id="btn_create", n_clicks=0),
-                html.Div(style={"width": "16px"}),
-                html.Button("このプリセットを保存(適用)", id="btn_save", n_clicks=0),
-                html.Button("JSONエクスポート", id="btn_export", n_clicks=0),
-                dcc.Download(id="dl_json"),
-                html.Div(style={"width": "16px"}),
-                html.Div(
-                    [
-                        html.Label("JSONインポート（追加）"),
-                        dcc.Upload(
-                            id="upload_json",
-                            children=html.Div(["ここにドロップ or クリックして選択"]),
-                            style={
-                                "width": "320px",
-                                "height": "38px",
-                                "lineHeight": "38px",
-                                "borderWidth": "1px",
-                                "borderStyle": "dashed",
-                                "borderRadius": "6px",
-                                "textAlign": "center",
-                                "cursor": "pointer",
-                            },
-                            multiple=False,
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                            children=[
+                                dcc.Dropdown(
+                                    id="dd_preset",
+                                    options=[],
+                                    value=None,
+                                    clearable=False,
+                                    style={"width": "320px"},
+                                    placeholder="プリセットを選択",
+                                ),
+                                html.Button("値を更新（保存）", id="btn_update", n_clicks=0),
+                                html.Button("JSONエクスポート", id="btn_export", n_clicks=0),
+                                html.Button("プリセット削除", id="btn_delete", n_clicks=0),
+                                dcc.Download(id="dl_json"),
+                            ],
                         ),
-                    ]
+                        html.Div(
+                            style={"fontSize": "12px", "opacity": 0.8, "marginTop": "6px"},
+                            children="※ 削除は確認ポップアップの後に実行されます",
+                        ),
+                    ],
                 ),
             ],
         ),
+
         html.Hr(),
+
         html.Div(id="table_area"),
         html.Div(id="msg", style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.9}),
     ],
@@ -178,40 +228,35 @@ app.layout = html.Div(
 
 
 # ---------------------------
-# プリセット一覧をDropdownへ反映 + 現在選択を維持/補正
-# （store_current_preset の Output はここだけ）
+# プリセット一覧をDropdownへ反映（選択を勝手に戻さない）
+# - storeが変わった時に options を更新
+# - value は「現在のvalueが存在するなら維持」、存在しない時だけ先頭に補正
+# これで「新規作成/アップロードの直後に、選択が勝手に戻る」系のバグを潰します
 # ---------------------------
 @callback(
     Output("dd_preset", "options"),
     Output("dd_preset", "value"),
-    Output("store_current_preset", "data"),
     Input("store_presets", "data"),
-    Input("dd_preset", "value"),
-    Input("store_action", "data"),
-    State("store_current_preset", "data"),
+    State("dd_preset", "value"),
 )
-def refresh_preset_dropdown(store, dd_value, action, current):
+def refresh_preset_dropdown(store, current_value):
     store = store or empty_store()
     presets = store.get("presets", {}) or {}
     names = sorted(list(presets.keys()))
     options = [{"label": n, "value": n} for n in names]
 
-    # actionで「このプリセットを選択したい」が来たら優先
-    desired = None
-    if isinstance(action, dict):
-        desired = action.get("select")
+    if current_value in presets:
+        return options, current_value
+    return options, (names[0] if names else None)
 
-    # 候補決定（優先順: desired -> dd_value -> current -> first -> None）
-    if desired in presets:
-        value = desired
-    elif dd_value in presets:
-        value = dd_value
-    elif current in presets:
-        value = current
-    else:
-        value = names[0] if names else None
 
-    return options, value, value
+# dd_preset の選択を store_current に同期
+@callback(
+    Output("store_current_preset", "data"),
+    Input("dd_preset", "value"),
+)
+def sync_current(value):
+    return value
 
 
 # ---------------------------
@@ -227,48 +272,40 @@ def render_table(store, current):
     presets = store.get("presets", {}) or {}
 
     if not current or current not in presets:
-        return html.Div("プリセットを作成してください。")
+        return html.Div("既存プリセットを選択するか、新規作成してください。")
 
     cfg_rows = presets[current].get("rows", {}) or {}
     return build_html_table(MASTER_ROWS, cfg_rows)
 
 
 # ---------------------------
-# raw 変更 → selected options/value 追従（行ごと）
+# 削除ボタン → 確認ポップアップ表示
 # ---------------------------
 @callback(
-    Output({"type": "sel_dd", "row_id": ALL}, "options"),
-    Output({"type": "sel_dd", "row_id": ALL}, "value"),
-    Input({"type": "raw_dd", "row_id": ALL}, "value"),
-    State({"type": "sel_dd", "row_id": ALL}, "value"),
+    Output("confirm_delete", "displayed"),
+    Input("btn_delete", "n_clicks"),
+    prevent_initial_call=True,
 )
-def sync_selected_options(all_raw_values, all_sel_values):
-    new_options = []
-    new_values = []
-    for raw_val, sel_val in zip(all_raw_values, all_sel_values):
-        raw_val = raw_val or []
-        sel_val = sel_val or []
-        opts = raw_val if raw_val else ALL_LEVELS
-        filtered_sel = [x for x in sel_val if x in opts]
-        new_options.append([{"label": x, "value": x} for x in opts])
-        new_values.append(filtered_sel)
-    return new_options, new_values
+def show_delete_confirm(_):
+    return True
 
 
 # ---------------------------
 # store_presets と msg の更新はここに一本化（重複Output回避）
-# - 新規作成
-# - 保存(適用)
+# - 新規作成（空）
+# - 新規名で保存（未作成なら作って保存）
+# - 既存更新（保存）
 # - JSONインポート（追加）
-# ついでに「作成/インポート後に選択したいプリセット名」を store_action に入れる
+# - 削除（confirmのsubmit後）
 # ---------------------------
 @callback(
     Output("store_presets", "data"),
-    Output("store_action", "data"),
     Output("msg", "children"),
     Input("btn_create", "n_clicks"),
-    Input("btn_save", "n_clicks"),
+    Input("btn_save_new", "n_clicks"),
+    Input("btn_update", "n_clicks"),
     Input("upload_json", "contents"),
+    Input("confirm_delete", "submit_n_clicks"),
     State("upload_json", "filename"),
     State("store_presets", "data"),
     State("store_current_preset", "data"),
@@ -280,8 +317,10 @@ def sync_selected_options(all_raw_values, all_sel_values):
 )
 def manage_presets(
     n_create,
-    n_save,
+    n_save_new,
+    n_update,
     upload_contents,
+    n_delete_submit,
     upload_filename,
     store,
     current,
@@ -295,8 +334,18 @@ def manage_presets(
 
     trigger = ctx.triggered_id
 
+    # 共通：画面の表（dropdown）の値を rows_cfg(dict) へ書き込む関数
+    def write_table_values(rows_cfg: dict):
+        for rid_obj, raw_val, sel_val in zip(raw_ids, raw_values, sel_values):
+            rid = rid_obj["row_id"]
+            rows_cfg[rid] = {
+                "workscope_raw": raw_val or [],
+                "selected_workscope": sel_val or [],
+                "updated_at": now_iso(),
+            }
+
     # -----------------
-    # CREATE
+    # CREATE（空のプリセットを作る）
     # -----------------
     if trigger == "btn_create":
         base = safe_name(new_name)
@@ -306,30 +355,44 @@ def manage_presets(
             "rows": {},
         }
         store["updated_at"] = now_iso()
-        # 作成したプリセットを選択したい
-        return store, {"select": name}, f'プリセットを作成しました: "{name}"'
+        return store, f'プリセットを作成しました: "{name}"（切替は右側のドロップダウンから）'
 
     # -----------------
-    # SAVE
+    # SAVE NEW（この名前で保存：未作成なら作ってから保存）
     # -----------------
-    if trigger == "btn_save":
+    if trigger == "btn_save_new":
+        base = safe_name(new_name)
+        if not base:
+            return no_update, "新規プリセット名を入力してください。"
+
+        # 既に同名があれば上書きせず、ユニーク名で新規作成（安全設計）
+        name = unique_name(set(presets.keys()), base)
+
+        presets[name] = {
+            "meta": {"created_at": now_iso(), "updated_at": now_iso(), "saved_mode": "save_new"},
+            "rows": {},
+        }
+        write_table_values(presets[name]["rows"])
+        presets[name]["meta"]["updated_at"] = now_iso()
+        store["updated_at"] = now_iso()
+
+        return store, f'この名前で保存しました: "{name}"（切替は右側のドロップダウンから）'
+
+    # -----------------
+    # UPDATE（既存の選択プリセットに上書き保存）
+    # -----------------
+    if trigger == "btn_update":
         if not current or current not in presets:
-            return no_update, no_update, "プリセットが未選択、または存在しません。"
+            return no_update, "既存プリセットが未選択、または存在しません。"
 
-        rows_cfg = presets[current].setdefault("rows", {})
-        for rid_obj, raw_val, sel_val in zip(raw_ids, raw_values, sel_values):
-            rid = rid_obj["row_id"]
-            rows_cfg[rid] = {
-                "workscope_raw": raw_val or [],
-                "selected_workscope": sel_val or [],
-                "updated_at": now_iso(),
-            }
+        presets[current].setdefault("rows", {})
+        write_table_values(presets[current]["rows"])
 
         presets[current].setdefault("meta", {})
         presets[current]["meta"]["updated_at"] = now_iso()
         store["updated_at"] = now_iso()
 
-        return store, no_update, f'保存しました: "{current}"（{len(raw_ids)}行）'
+        return store, f'更新しました: "{current}"'
 
     # -----------------
     # IMPORT JSON（追加）
@@ -340,22 +403,20 @@ def manage_presets(
             decoded = base64.b64decode(b64data).decode("utf-8")
             payload = json.loads(decoded)
         except Exception as e:
-            return no_update, no_update, f"インポート失敗: JSONの読み込みに失敗しました（{e}）"
+            return no_update, f"インポート失敗: JSONの読み込みに失敗しました（{e}）"
 
         imported_presets = payload.get("presets")
         if not isinstance(imported_presets, dict):
-            return no_update, no_update, "インポート失敗: presets が見つかりません。"
+            return no_update, "インポート失敗: presets が見つかりません。"
 
         added = 0
         existing = set(presets.keys())
-        last_added_name = None
 
         for name, p in imported_presets.items():
             if not isinstance(p, dict):
                 continue
 
             base = safe_name(name)
-            # 同名衝突は imported サフィックスで回避
             if base in existing:
                 base = f"{base} (imported)"
             new_name2 = unique_name(existing, base)
@@ -374,33 +435,50 @@ def manage_presets(
 
             existing.add(new_name2)
             added += 1
-            last_added_name = new_name2
 
         store["updated_at"] = now_iso()
+        return store, f"インポート完了: {added}件追加（ファイル: {upload_filename}）"
 
-        action = {"select": last_added_name} if last_added_name else no_update
-        return store, action, f"インポート完了: {added}件追加（ファイル: {upload_filename}）"
+    # -----------------
+    # DELETE（ConfirmDialogのsubmit後に削除）
+    # -----------------
+    if trigger == "confirm_delete":
+        if not current or current not in presets:
+            return no_update, "削除対象のプリセットが未選択、または存在しません。"
 
-    return no_update, no_update, no_update
+        del presets[current]
+        store["updated_at"] = now_iso()
+
+        return store, f'削除しました: "{current}"'
+
+    return no_update, no_update
 
 
 # ---------------------------
-# JSONエクスポート（全プリセット）
+# JSONエクスポート（既存で選択中の1プリセットだけ）
 # ---------------------------
 @callback(
     Output("dl_json", "data"),
     Input("btn_export", "n_clicks"),
     State("store_presets", "data"),
+    State("store_current_preset", "data"),
     prevent_initial_call=True,
 )
-def export_json(_, store):
+def export_json(_, store, current):
     store = store or empty_store()
+    presets = store.get("presets", {}) or {}
+
+    if not current or current not in presets:
+        return no_update
+
     payload = {
         "version": store.get("version", 1),
         "exported_at": now_iso(),
-        "presets": store.get("presets", {}),
+        "presets": {
+            current: presets[current]
+        },
     }
-    fname = f"presets_{now_iso().replace(':','-')}.json"
+    fname = f"preset_{current}_{now_iso().replace(':','-')}.json"
     return dict(
         content=json.dumps(payload, ensure_ascii=False, indent=2),
         filename=fname,
