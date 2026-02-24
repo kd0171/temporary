@@ -1,18 +1,20 @@
+import base64
+import copy
 import json
 from datetime import datetime
+
 from dash import Dash, html, dcc, Input, Output, State, ALL, callback, no_update
 
 app = Dash(__name__)
 
 # ---------------------------
-# 1) 固定マスタ（例）
+# 固定マスタ（engine/part は事前定義）
 # ---------------------------
 MASTER_ROWS = [
     {"engine_type": "V2500", "partnumber": "72-00-00", "partname": "Engine Module"},
     {"engine_type": "V2500", "partnumber": "72-31-00", "partname": "Fan Module"},
     {"engine_type": "V2500", "partnumber": "72-32-00", "partname": "Intermediate Case Module"},
 ]
-
 ALL_LEVELS = ["LEVEL 1", "LEVEL 2", "LEVEL 2.1", "LEVEL 2.9", "LEVEL 3"]
 
 def make_row_id(r: dict) -> str:
@@ -21,12 +23,25 @@ def make_row_id(r: dict) -> str:
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
+def safe_name(name: str) -> str:
+    name = (name or "").strip()
+    return name if name else "Untitled"
+
+def unique_name(existing: set[str], base: str) -> str:
+    """既存nameと衝突したら suffix を付けてユニークにする"""
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base} ({i})" in existing:
+        i += 1
+    return f"{base} ({i})"
+
 # ---------------------------
-# 2) html.Table を組み立て
+# html.Table 組み立て
 # ---------------------------
-def build_html_table(master_rows, preset_data_for_rows: dict):
+def build_html_table(master_rows, preset_rows_cfg: dict):
     """
-    preset_data_for_rows: {row_id: {"workscope_raw":[...], "selected_workscope":[...]} }
+    preset_rows_cfg: {row_id: {"workscope_raw":[...], "selected_workscope":[...]} }
     """
     header = html.Thead(html.Tr([
         html.Th("engine type"),
@@ -39,9 +54,9 @@ def build_html_table(master_rows, preset_data_for_rows: dict):
     body_rows = []
     for r in master_rows:
         rid = make_row_id(r)
-        cfg = preset_data_for_rows.get(rid, {})
-        raw_val = cfg.get("workscope_raw", [])
-        sel_val = cfg.get("selected_workscope", [])
+        cfg = preset_rows_cfg.get(rid, {})
+        raw_val = cfg.get("workscope_raw", []) or []
+        sel_val = cfg.get("selected_workscope", []) or []
 
         raw_dd = dcc.Dropdown(
             options=[{"label": x, "value": x} for x in ALL_LEVELS],
@@ -51,12 +66,11 @@ def build_html_table(master_rows, preset_data_for_rows: dict):
             id={"type": "raw_dd", "row_id": rid},
         )
 
-        # selected は raw の部分集合にしたい場合、options を raw_val に寄せるのが自然。
-        # ただし raw_val が空の時に選べないので、ここでは raw_val が空なら ALL_LEVELS を出します。
-        sel_options = raw_val if raw_val else ALL_LEVELS
+        # selected は raw の部分集合にしたいなら options を raw に合わせる
+        sel_opts = raw_val if raw_val else ALL_LEVELS
         sel_dd = dcc.Dropdown(
-            options=[{"label": x, "value": x} for x in sel_options],
-            value=sel_val,
+            options=[{"label": x, "value": x} for x in sel_opts],
+            value=[x for x in sel_val if x in sel_opts],
             multi=True,
             placeholder="selected を選択",
             id={"type": "sel_dd", "row_id": rid},
@@ -64,83 +78,171 @@ def build_html_table(master_rows, preset_data_for_rows: dict):
 
         body_rows.append(
             html.Tr([
-                html.Td(r["engine_type"]),
-                html.Td(r["partnumber"]),
-                html.Td(r["partname"]),
-                html.Td(raw_dd),
-                html.Td(sel_dd),
+                html.Td(r["engine_type"], style={"border": "1px solid #ddd", "padding": "6px"}),
+                html.Td(r["partnumber"], style={"border": "1px solid #ddd", "padding": "6px"}),
+                html.Td(r["partname"], style={"border": "1px solid #ddd", "padding": "6px"}),
+                html.Td(raw_dd, style={"border": "1px solid #ddd", "padding": "6px", "minWidth": "280px"}),
+                html.Td(sel_dd, style={"border": "1px solid #ddd", "padding": "6px", "minWidth": "280px"}),
             ])
         )
 
     return html.Table(
         [header, html.Tbody(body_rows)],
-        style={
-            "borderCollapse": "collapse",
-            "width": "100%",
-        }
+        style={"borderCollapse": "collapse", "width": "100%"}
     )
 
 # ---------------------------
-# 3) レイアウト
+# データ構造（Store）
+# store_presets:
+# {
+#   "version": 1,
+#   "updated_at": "...",
+#   "presets": {
+#      "Case1": {"rows": {row_id: {...}}, "meta": {...}},
+#      "Case2": ...
+#   }
+# }
+# ---------------------------
+def empty_store():
+    return {"version": 1, "updated_at": now_iso(), "presets": {}}
+
+# ---------------------------
+# Layout
 # ---------------------------
 app.layout = html.Div(
-    style={"maxWidth": "1200px", "margin": "0 auto", "padding": "12px"},
+    style={"maxWidth": "1300px", "margin": "0 auto", "padding": "12px"},
     children=[
-        html.H3("Pre-Selection (html.Table版)"),
+        html.H3("Pre-Selection (html.Table + Presets + Local Store)"),
+
+        # 永続 Store（localStorage）
+        dcc.Store(id="store_presets", storage_type="local", data=empty_store()),
+        dcc.Store(id="store_current_preset", storage_type="local", data=None),
 
         html.Div(
-            style={"display": "flex", "gap": "8px", "alignItems": "center"},
+            style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
             children=[
-                html.Label("Preset name:"),
-                dcc.Input(id="preset_name", value="Case1", type="text", style={"width": "240px"}),
-                html.Button("保存(適用)", id="btn_save", n_clicks=0),
+                html.Div([
+                    html.Label("Preset切替"),
+                    dcc.Dropdown(id="dd_preset", options=[], value=None, clearable=False, style={"width": "320px"}),
+                ]),
+                html.Div([
+                    html.Label("新規プリセット名"),
+                    dcc.Input(id="inp_new_preset", placeholder="例: Case1", type="text", style={"width": "240px"}),
+                ]),
+                html.Button("新規作成", id="btn_create", n_clicks=0),
+
+                html.Div(style={"width":"16px"}),
+
+                html.Button("このプリセットを保存(適用)", id="btn_save", n_clicks=0),
                 html.Button("JSONエクスポート", id="btn_export", n_clicks=0),
                 dcc.Download(id="dl_json"),
+
+                html.Div(style={"width":"16px"}),
+
+                html.Div([
+                    html.Label("JSONインポート（追加）"),
+                    dcc.Upload(
+                        id="upload_json",
+                        children=html.Div(["ここにドロップ or クリックして選択"]),
+                        style={
+                            "width": "320px",
+                            "height": "38px",
+                            "lineHeight": "38px",
+                            "borderWidth": "1px",
+                            "borderStyle": "dashed",
+                            "borderRadius": "6px",
+                            "textAlign": "center",
+                            "cursor": "pointer",
+                        },
+                        multiple=False,
+                    )
+                ]),
             ],
         ),
 
         html.Hr(),
 
-        # 擬似DB（プリセットを全部持つ）
-        # 形式: {"Case1": {"row_id": {"workscope_raw":[...], "selected_workscope":[...]}, ...}, "Case2": {...}}
-        dcc.Store(id="store_presets", data={"Case1": {}}),
-
-        # 現在のプリセット名の状態（UIで入力した名前を使う）
-        dcc.Store(id="store_current_preset", data="Case1"),
-
-        # テーブル描画領域
         html.Div(id="table_area"),
-
-        html.Div(id="msg", style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.85}),
+        html.Div(id="msg", style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.9}),
     ],
 )
 
 # ---------------------------
-# 4) 現在プリセット名を反映
+# プリセット一覧をDropdownへ反映（常時）
 # ---------------------------
 @callback(
+    Output("dd_preset", "options"),
+    Output("dd_preset", "value"),
     Output("store_current_preset", "data"),
-    Input("preset_name", "value"),
+    Input("store_presets", "data"),
+    State("store_current_preset", "data"),
 )
-def sync_preset_name(name):
-    return (name or "").strip() or "Case1"
+def refresh_preset_dropdown(store, current):
+    store = store or empty_store()
+    presets = store.get("presets", {}) or {}
+    names = sorted(list(presets.keys()))
+    options = [{"label": n, "value": n} for n in names]
+
+    # current が無い or 消えたなら先頭を選ぶ
+    if current in presets:
+        value = current
+    else:
+        value = names[0] if names else None
+
+    return options, value, value
+
+# dd_preset選択を current に同期（念のため）
+@callback(
+    Output("store_current_preset", "data"),
+    Input("dd_preset", "value"),
+)
+def sync_current(value):
+    return value
 
 # ---------------------------
-# 5) テーブル描画（プリセット内容を反映して html.Table を作り直す）
+# 新規プリセット作成
+# ---------------------------
+@callback(
+    Output("store_presets", "data"),
+    Output("msg", "children"),
+    Input("btn_create", "n_clicks"),
+    State("inp_new_preset", "value"),
+    State("store_presets", "data"),
+    prevent_initial_call=True
+)
+def create_preset(_, name, store):
+    store = copy.deepcopy(store or empty_store())
+    presets = store.setdefault("presets", {})
+    base = safe_name(name)
+
+    new_name = unique_name(set(presets.keys()), base)
+    presets[new_name] = {
+        "meta": {"created_at": now_iso(), "updated_at": now_iso()},
+        "rows": {}  # row_id -> config
+    }
+    store["updated_at"] = now_iso()
+    return store, f'プリセットを作成しました: "{new_name}"'
+
+# ---------------------------
+# テーブル描画（current preset を反映）
 # ---------------------------
 @callback(
     Output("table_area", "children"),
     Input("store_presets", "data"),
     Input("store_current_preset", "data"),
 )
-def render_table(store_presets, current_preset):
-    presets = store_presets or {}
-    current = presets.get(current_preset, {})
-    return build_html_table(MASTER_ROWS, current)
+def render_table(store, current):
+    store = store or empty_store()
+    presets = store.get("presets", {}) or {}
+
+    if not current or current not in presets:
+        return html.Div("プリセットを作成してください。")
+
+    cfg_rows = presets[current].get("rows", {}) or {}
+    return build_html_table(MASTER_ROWS, cfg_rows)
 
 # ---------------------------
-# 6) raw を変えたら selected の options を追従させる（行ごと）
-#    ※ selected は raw の部分集合にしたい場合の必須処理
+# raw 変更 → selected options/value 追従（行ごと）
 # ---------------------------
 @callback(
     Output({"type": "sel_dd", "row_id": ALL}, "options"),
@@ -149,25 +251,19 @@ def render_table(store_presets, current_preset):
     State({"type": "sel_dd", "row_id": ALL}, "value"),
 )
 def sync_selected_options(all_raw_values, all_sel_values):
-    # ALLでまとめて来るので、行ごとに options/value を返す
     new_options = []
     new_values = []
-
     for raw_val, sel_val in zip(all_raw_values, all_sel_values):
         raw_val = raw_val or []
         sel_val = sel_val or []
-
         opts = raw_val if raw_val else ALL_LEVELS
-        # selected が raw に含まれない値を持っていたら落とす
         filtered_sel = [x for x in sel_val if x in opts]
-
         new_options.append([{"label": x, "value": x} for x in opts])
         new_values.append(filtered_sel)
-
     return new_options, new_values
 
 # ---------------------------
-# 7) 保存ボタンで Store に書き戻す（擬似追加/編集）
+# 保存(適用)：画面上の全行の dropdown を current preset に書き戻す
 # ---------------------------
 @callback(
     Output("store_presets", "data"),
@@ -180,22 +276,33 @@ def sync_selected_options(all_raw_values, all_sel_values):
     State({"type": "sel_dd", "row_id": ALL}, "value"),
     prevent_initial_call=True,
 )
-def save_to_store(n, store_presets, current_preset, raw_ids, raw_values, sel_values):
-    presets = store_presets or {}
-    presets.setdefault(current_preset, {})
+def save_current_preset(_, store, current, raw_ids, raw_values, sel_values):
+    if not current:
+        return no_update, "プリセットが未選択です。"
 
+    store = copy.deepcopy(store or empty_store())
+    presets = store.setdefault("presets", {})
+    if current not in presets:
+        return no_update, f'プリセット "{current}" が見つかりません。'
+
+    rows_cfg = presets[current].setdefault("rows", {})
     for rid_obj, raw_val, sel_val in zip(raw_ids, raw_values, sel_values):
         rid = rid_obj["row_id"]
-        presets[current_preset][rid] = {
+        rows_cfg[rid] = {
             "workscope_raw": raw_val or [],
             "selected_workscope": sel_val or [],
             "updated_at": now_iso(),
         }
 
-    return presets, f'保存しました: preset="{current_preset}" / {len(raw_ids)}行'
+    presets[current].setdefault("meta", {})
+    presets[current]["meta"]["updated_at"] = now_iso()
+    store["updated_at"] = now_iso()
+
+    return store, f'保存しました: "{current}"（{len(raw_ids)}行）'
 
 # ---------------------------
-# 8) JSONエクスポート（ローカル保存用）
+# JSONエクスポート（全プリセット or currentだけ、どちらでも）
+# ここでは「全プリセット」を出すようにしています。
 # ---------------------------
 @callback(
     Output("dl_json", "data"),
@@ -203,17 +310,81 @@ def save_to_store(n, store_presets, current_preset, raw_ids, raw_values, sel_val
     State("store_presets", "data"),
     prevent_initial_call=True,
 )
-def export_json(n, presets):
+def export_json(_, store):
+    store = store or empty_store()
     payload = {
-        "version": 1,
+        "version": store.get("version", 1),
         "exported_at": now_iso(),
-        "presets": presets or {},
+        "presets": store.get("presets", {}),
     }
+    fname = f"presets_{now_iso().replace(':','-')}.json"
     return dict(
         content=json.dumps(payload, ensure_ascii=False, indent=2),
-        filename=f"presets_{now_iso().replace(':','-')}.json",
+        filename=fname,
         type="application/json",
     )
+
+# ---------------------------
+# JSONインポート（追加マージ）
+# - storeに無いプリセット（名前が違うもの）を簡単に追加
+# - 同名があれば "(imported)" で自動リネームして衝突回避
+# ---------------------------
+@callback(
+    Output("store_presets", "data"),
+    Output("msg", "children"),
+    Input("upload_json", "contents"),
+    State("upload_json", "filename"),
+    State("store_presets", "data"),
+    prevent_initial_call=True,
+)
+def import_json(contents, filename, store):
+    if not contents:
+        return no_update, no_update
+
+    store = copy.deepcopy(store or empty_store())
+    presets = store.setdefault("presets", {})
+    existing_names = set(presets.keys())
+
+    try:
+        header, b64data = contents.split(",", 1)
+        decoded = base64.b64decode(b64data).decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception as e:
+        return no_update, f"インポート失敗: JSONの読み込みに失敗しました（{e}）"
+
+    imported_presets = payload.get("presets")
+    if not isinstance(imported_presets, dict):
+        return no_update, "インポート失敗: presets が見つかりません。"
+
+    added = 0
+    for name, p in imported_presets.items():
+        if not isinstance(p, dict):
+            continue
+
+        base = safe_name(name)
+        # 既に同名がある場合は imported suffix で衝突回避
+        if base in existing_names:
+            base = f"{base} (imported)"
+        new_name = unique_name(existing_names, base)
+
+        # 最低限 rows が dict なら取り込む
+        rows = p.get("rows", {})
+        if not isinstance(rows, dict):
+            rows = {}
+
+        presets[new_name] = {
+            "meta": p.get("meta", {}) if isinstance(p.get("meta", {}), dict) else {},
+            "rows": rows,
+        }
+        presets[new_name].setdefault("meta", {})
+        presets[new_name]["meta"]["imported_from"] = filename or "uploaded.json"
+        presets[new_name]["meta"]["imported_at"] = now_iso()
+
+        existing_names.add(new_name)
+        added += 1
+
+    store["updated_at"] = now_iso()
+    return store, f'インポート完了: {added}件追加（ファイル: {filename}）'
 
 if __name__ == "__main__":
     app.run_server(debug=True)
