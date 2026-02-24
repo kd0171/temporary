@@ -30,8 +30,8 @@ def now_iso() -> str:
 
 
 def safe_name(name: str) -> str:
-    name = (name or "").strip()
-    return name if name else "Untitled"
+    # 空白は空扱い（Untitledにしない：今回の要件で「空なら作らせない」ため）
+    return (name or "").strip()
 
 
 def unique_name(existing: set[str], base: str) -> str:
@@ -44,13 +44,24 @@ def unique_name(existing: set[str], base: str) -> str:
 
 
 def empty_store():
-    # store_presets["presets"] は dict: {preset_name: {"meta":..., "rows":{row_id:{...}}}}
     return {"version": 1, "updated_at": now_iso(), "presets": {}}
 
 
+def normalize_import_payload(payload: dict) -> dict:
+    """
+    受け取ったJSONの互換性を少し持たせる：
+    - {"presets": {...}} ならそのまま
+    - {"version":..., "presets": {...}} もOK
+    - 単一プリセット形式を想定して {"preset": {...}, "name": "..."} みたいなのは今回は扱わない（必要なら拡張可能）
+    """
+    presets = payload.get("presets")
+    if isinstance(presets, dict):
+        return presets
+    return {}
+
+
 # ---------------------------
-# html.Table（デザインは前の感じに戻す）
-# - selected workscope は raw に制限しない（両方ALL_LEVELSから自由に選べる）
+# html.Table（selected workscope は raw に制限しない）
 # ---------------------------
 def build_html_table(master_rows, preset_rows_cfg: dict):
     header = html.Thead(
@@ -144,10 +155,7 @@ app.layout = html.Div(
                 html.Div(
                     style=box_style,
                     children=[
-                        html.Div(
-                            style={"fontWeight": 700, "marginBottom": "8px"},
-                            children="新規（作成 / 取り込み）",
-                        ),
+                        html.Div(style={"fontWeight": 700, "marginBottom": "8px"}, children="新規（作成 / 取り込み）"),
                         html.Div(
                             style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
                             children=[
@@ -158,7 +166,6 @@ app.layout = html.Div(
                                     style={"width": "280px"},
                                 ),
                                 html.Button("新規プリセット作成", id="btn_create", n_clicks=0),
-                                # 「新規として保存」＝今の表の値を、この名前のプリセットとして保存（未作成なら作って保存）
                                 html.Button("この名前で保存", id="btn_save_new", n_clicks=0),
                                 dcc.Upload(
                                     id="upload_json",
@@ -189,10 +196,7 @@ app.layout = html.Div(
                 html.Div(
                     style=box_style,
                     children=[
-                        html.Div(
-                            style={"fontWeight": 700, "marginBottom": "8px"},
-                            children="既存（切替 / 更新 / 出力 / 削除）",
-                        ),
+                        html.Div(style={"fontWeight": 700, "marginBottom": "8px"}, children="既存（切替 / 更新 / 出力 / 削除）"),
                         html.Div(
                             style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
                             children=[
@@ -205,7 +209,8 @@ app.layout = html.Div(
                                     placeholder="プリセットを選択",
                                 ),
                                 html.Button("値を更新（保存）", id="btn_update", n_clicks=0),
-                                html.Button("JSONエクスポート", id="btn_export", n_clicks=0),
+                                html.Button("JSONエクスポート（選択中）", id="btn_export_one", n_clicks=0),
+                                html.Button("全JSONエクスポート", id="btn_export_all", n_clicks=0),
                                 html.Button("プリセット削除", id="btn_delete", n_clicks=0),
                                 dcc.Download(id="dl_json"),
                             ],
@@ -221,6 +226,18 @@ app.layout = html.Div(
 
         html.Hr(),
 
+        # 表の上左側に「クリア」ボタン（新規作成向け）
+        html.Div(
+            style={"display": "flex", "gap": "8px", "alignItems": "center", "marginBottom": "8px"},
+            children=[
+                html.Button("表の選択をすべてクリア（raw/selected）", id="btn_clear_table", n_clicks=0),
+                html.Div(
+                    style={"fontSize": "12px", "opacity": 0.8},
+                    children="※ 新規作成前に、現在の表の選択を空にしたい場合に使用",
+                ),
+            ],
+        ),
+
         html.Div(id="table_area"),
         html.Div(id="msg", style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.9}),
     ],
@@ -229,9 +246,6 @@ app.layout = html.Div(
 
 # ---------------------------
 # プリセット一覧をDropdownへ反映（選択を勝手に戻さない）
-# - storeが変わった時に options を更新
-# - value は「現在のvalueが存在するなら維持」、存在しない時だけ先頭に補正
-# これで「新規作成/アップロードの直後に、選択が勝手に戻る」系のバグを潰します
 # ---------------------------
 @callback(
     Output("dd_preset", "options"),
@@ -250,7 +264,6 @@ def refresh_preset_dropdown(store, current_value):
     return options, (names[0] if names else None)
 
 
-# dd_preset の選択を store_current に同期
 @callback(
     Output("store_current_preset", "data"),
     Input("dd_preset", "value"),
@@ -272,10 +285,31 @@ def render_table(store, current):
     presets = store.get("presets", {}) or {}
 
     if not current or current not in presets:
+        # current 未選択でも、テーブル自体は出しておきたい場合は空presetで表示してもOK
+        # 今回は「未選択なら案内表示」
         return html.Div("既存プリセットを選択するか、新規作成してください。")
 
     cfg_rows = presets[current].get("rows", {}) or {}
     return build_html_table(MASTER_ROWS, cfg_rows)
+
+
+# ---------------------------
+# クリアボタン：表の raw/selected の value を空にする
+# ※ Dashは「同じOutputは1 callback」なので、この callback が value を管理します。
+# ※ 表の描画による value 初期化は build_html_table 側で value を渡しているため、
+#    クリアは「現在表示されているDropdownのvalue」を直接上書きする。
+# ---------------------------
+@callback(
+    Output({"type": "raw_dd", "row_id": ALL}, "value"),
+    Output({"type": "sel_dd", "row_id": ALL}, "value"),
+    Input("btn_clear_table", "n_clicks"),
+    State({"type": "raw_dd", "row_id": ALL}, "value"),
+    State({"type": "sel_dd", "row_id": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def clear_table(_, raw_vals, sel_vals):
+    # 行数分の空リストを返す
+    return [[] for _ in (raw_vals or [])], [[] for _ in (sel_vals or [])]
 
 
 # ---------------------------
@@ -291,12 +325,12 @@ def show_delete_confirm(_):
 
 
 # ---------------------------
-# store_presets と msg の更新はここに一本化（重複Output回避）
-# - 新規作成（空）
-# - 新規名で保存（未作成なら作って保存）
-# - 既存更新（保存）
-# - JSONインポート（追加）
-# - 削除（confirmのsubmit後）
+# store_presets と msg の更新は一本化
+# - 新規作成（空）: 名前空なら作らない
+# - 新規名で保存（未作成なら作って保存）: 名前空なら保存しない
+# - 既存更新
+# - JSONインポート（複数プリセット対応で全追加）
+# - 削除（confirm後）
 # ---------------------------
 @callback(
     Output("store_presets", "data"),
@@ -331,10 +365,8 @@ def manage_presets(
 ):
     store = copy.deepcopy(store or empty_store())
     presets = store.setdefault("presets", {})
-
     trigger = ctx.triggered_id
 
-    # 共通：画面の表（dropdown）の値を rows_cfg(dict) へ書き込む関数
     def write_table_values(rows_cfg: dict):
         for rid_obj, raw_val, sel_val in zip(raw_ids, raw_values, sel_values):
             rid = rid_obj["row_id"]
@@ -344,30 +376,25 @@ def manage_presets(
                 "updated_at": now_iso(),
             }
 
-    # -----------------
-    # CREATE（空のプリセットを作る）
-    # -----------------
+    # CREATE（空作成）
     if trigger == "btn_create":
         base = safe_name(new_name)
+        if not base:
+            return no_update, "新規プリセット名が空です。名前を入力してから作成してください。"
         name = unique_name(set(presets.keys()), base)
         presets[name] = {
             "meta": {"created_at": now_iso(), "updated_at": now_iso()},
             "rows": {},
         }
         store["updated_at"] = now_iso()
-        return store, f'プリセットを作成しました: "{name}"（切替は右側のドロップダウンから）'
+        return store, f'プリセットを作成しました: "{name}"（右のドロップダウンで選択してください）'
 
-    # -----------------
-    # SAVE NEW（この名前で保存：未作成なら作ってから保存）
-    # -----------------
+    # SAVE NEW（新規名で保存：未作成なら作成して保存）
     if trigger == "btn_save_new":
         base = safe_name(new_name)
         if not base:
-            return no_update, "新規プリセット名を入力してください。"
-
-        # 既に同名があれば上書きせず、ユニーク名で新規作成（安全設計）
+            return no_update, "新規プリセット名が空です。名前を入力してから保存してください。"
         name = unique_name(set(presets.keys()), base)
-
         presets[name] = {
             "meta": {"created_at": now_iso(), "updated_at": now_iso(), "saved_mode": "save_new"},
             "rows": {},
@@ -375,28 +402,20 @@ def manage_presets(
         write_table_values(presets[name]["rows"])
         presets[name]["meta"]["updated_at"] = now_iso()
         store["updated_at"] = now_iso()
+        return store, f'この名前で保存しました: "{name}"（右のドロップダウンで選択してください）'
 
-        return store, f'この名前で保存しました: "{name}"（切替は右側のドロップダウンから）'
-
-    # -----------------
-    # UPDATE（既存の選択プリセットに上書き保存）
-    # -----------------
+    # UPDATE（既存上書き）
     if trigger == "btn_update":
         if not current or current not in presets:
             return no_update, "既存プリセットが未選択、または存在しません。"
-
         presets[current].setdefault("rows", {})
         write_table_values(presets[current]["rows"])
-
         presets[current].setdefault("meta", {})
         presets[current]["meta"]["updated_at"] = now_iso()
         store["updated_at"] = now_iso()
-
         return store, f'更新しました: "{current}"'
 
-    # -----------------
-    # IMPORT JSON（追加）
-    # -----------------
+    # IMPORT（複数プリセットを含むJSONでも全追加）
     if trigger == "upload_json" and upload_contents:
         try:
             header, b64data = upload_contents.split(",", 1)
@@ -405,18 +424,16 @@ def manage_presets(
         except Exception as e:
             return no_update, f"インポート失敗: JSONの読み込みに失敗しました（{e}）"
 
-        imported_presets = payload.get("presets")
-        if not isinstance(imported_presets, dict):
-            return no_update, "インポート失敗: presets が見つかりません。"
+        imported_presets = normalize_import_payload(payload)
+        if not imported_presets:
+            return no_update, "インポート失敗: presets が見つかりません（JSON形式を確認してください）。"
 
         added = 0
         existing = set(presets.keys())
-
         for name, p in imported_presets.items():
             if not isinstance(p, dict):
                 continue
-
-            base = safe_name(name)
+            base = safe_name(name) or "Imported"
             if base in existing:
                 base = f"{base} (imported)"
             new_name2 = unique_name(existing, base)
@@ -439,46 +456,63 @@ def manage_presets(
         store["updated_at"] = now_iso()
         return store, f"インポート完了: {added}件追加（ファイル: {upload_filename}）"
 
-    # -----------------
-    # DELETE（ConfirmDialogのsubmit後に削除）
-    # -----------------
+    # DELETE（ConfirmDialog submit 後）
     if trigger == "confirm_delete":
         if not current or current not in presets:
             return no_update, "削除対象のプリセットが未選択、または存在しません。"
-
         del presets[current]
         store["updated_at"] = now_iso()
-
         return store, f'削除しました: "{current}"'
 
     return no_update, no_update
 
 
 # ---------------------------
-# JSONエクスポート（既存で選択中の1プリセットだけ）
+# JSONエクスポート：選択中1件
 # ---------------------------
 @callback(
     Output("dl_json", "data"),
-    Input("btn_export", "n_clicks"),
+    Input("btn_export_one", "n_clicks"),
     State("store_presets", "data"),
     State("store_current_preset", "data"),
     prevent_initial_call=True,
 )
-def export_json(_, store, current):
+def export_one(_, store, current):
     store = store or empty_store()
     presets = store.get("presets", {}) or {}
-
     if not current or current not in presets:
         return no_update
 
     payload = {
         "version": store.get("version", 1),
         "exported_at": now_iso(),
-        "presets": {
-            current: presets[current]
-        },
+        "presets": {current: presets[current]},
     }
     fname = f"preset_{current}_{now_iso().replace(':','-')}.json"
+    return dict(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        filename=fname,
+        type="application/json",
+    )
+
+
+# ---------------------------
+# JSONエクスポート：全件
+# ---------------------------
+@callback(
+    Output("dl_json", "data"),
+    Input("btn_export_all", "n_clicks"),
+    State("store_presets", "data"),
+    prevent_initial_call=True,
+)
+def export_all(_, store):
+    store = store or empty_store()
+    payload = {
+        "version": store.get("version", 1),
+        "exported_at": now_iso(),
+        "presets": store.get("presets", {}),
+    }
+    fname = f"presets_ALL_{now_iso().replace(':','-')}.json"
     return dict(
         content=json.dumps(payload, ensure_ascii=False, indent=2),
         filename=fname,
