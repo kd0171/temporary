@@ -522,3 +522,63 @@ def export_all(_, store):
 
 if __name__ == "__main__":
     app.run_server(debug=True)
+
+@callback(
+    Output("dl_json", "data"),
+    Input("btn_export_one", "n_clicks"),
+    Input("btn_export_all", "n_clicks"),
+    State("store_presets", "data"),
+    State("store_current_preset", "data"),
+    prevent_initial_call=True,
+)
+def export_json(n_one, n_all, store, current):
+
+    trigger = ctx.triggered_id
+    store = store or empty_store()
+    presets = store.get("presets", {}) or {}
+
+    # -------------------------
+    # 単一プリセット
+    # -------------------------
+    if trigger == "btn_export_one":
+
+        if not current or current not in presets:
+            return no_update
+
+        payload = {
+            "version": store.get("version", 1),
+            "exported_at": now_iso(),
+            "presets": {
+                current: presets[current]
+            },
+        }
+
+        filename = f"preset_{current}_{now_iso().replace(':','-')}.json"
+
+        return dict(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            filename=filename,
+            type="application/json",
+        )
+
+    # -------------------------
+    # 全プリセット
+    # -------------------------
+    if trigger == "btn_export_all":
+
+        payload = {
+            "version": store.get("version", 1),
+            "exported_at": now_iso(),
+            "presets": presets,
+        }
+
+        filename = f"presets_ALL_{now_iso().replace(':','-')}.json"
+
+        return dict(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            filename=filename,
+            type="application/json",
+        )
+
+    return no_update
+
